@@ -1,0 +1,230 @@
+---
+title: "gm.ckpts — loading, saving, and checkpoint paths"
+description: "load_params and save_params; CheckpointPath enum with all official GCS paths; LoadCheckpoint, SkipLoRA, and AnchoredPolicyLoader init transforms."
+---
+
+The `gm.ckpts` module handles reading and writing Gemma parameters. It supports multiple checkpoint formats (flat, stacked, nested, and Kauldron trainer checkpoints) and provides init-transform objects that integrate with the Kauldron training framework.
+
+## Functions
+
+### load_params
+
+```python
+gm.ckpts.load_params(
+    path: epath.PathLike,
+    *,
+    params: Params | None = None,
+    donate: bool = True,
+    text_only: bool = False,
+    sharding: kd.sharding.ShardingTree | None = None,
+    quantize: bool = False,
+) -> Params
+```
+
+Restores model parameters from an Orbax checkpoint. Automatically detects whether the checkpoint uses the flat, stacked, nested, or Kauldron layout and converts it to the nested structure expected by `model.init()['params']`.
+
+<ParamField path="path" type="epath.PathLike" required>
+  Path to the Orbax checkpoint directory. Can be a `CheckpointPath` enum value or any path string accepted by `etils.epath`.
+</ParamField>
+
+<ParamField path="params" type="Params | None" default="None">
+  An existing parameter tree used to specify the target dtype and sharding. When provided, parameters are restored into the same structure. Mutually exclusive with `sharding`.
+</ParamField>
+
+<ParamField path="donate" type="bool" default="True">
+  When `True` and `params` is provided, the memory held by `params` is released before loading. Avoids peak memory doubling.
+</ParamField>
+
+<ParamField path="text_only" type="bool" default="False">
+  When `True`, the vision encoder parameters are skipped. Useful for text-only fine-tuning with a multimodal checkpoint.
+</ParamField>
+
+<ParamField path="sharding" type="kd.sharding.ShardingTree | None" default="None">
+  Sharding spec to apply to the restored parameters. Mutually exclusive with `params`.
+</ParamField>
+
+<ParamField path="quantize" type="bool" default="False">
+  When `True`, the parameter tree is restructured for quantization-aware training after loading. Does not actually quantize weights; combine with `gm.nn.QuantizationAwareWrapper` for QAT.
+</ParamField>
+
+**Example:**
+
+```python
+import gemma.gm.ckpts as gm_ckpts
+
+params = gm_ckpts.load_params(gm_ckpts.CheckpointPath.GEMMA3_4B_IT)
+```
+
+---
+
+### save_params
+
+```python
+gm.ckpts.save_params(
+    params: Params,
+    path: epath.PathLike,
+    *,
+    wait_until_finished: bool = False,
+) -> None
+```
+
+Saves parameters to an Orbax checkpoint in the nested format.
+
+<ParamField path="params" type="Params" required>
+  The parameter tree to save, as returned by `model.init()['params']` or `load_params()`.
+</ParamField>
+
+<ParamField path="path" type="epath.PathLike" required>
+  Destination directory for the checkpoint.
+</ParamField>
+
+<ParamField path="wait_until_finished" type="bool" default="False">
+  When `True`, blocks until the checkpoint write is complete. When `False`, the save may complete asynchronously.
+</ParamField>
+
+---
+
+## Init transforms
+
+These classes implement `kd.ckpts.InitTransform` and are used with `kd.train.Trainer` to load weights at the start of training.
+
+### LoadCheckpoint
+
+```python
+gm.ckpts.LoadCheckpoint(
+    path: epath.PathLike,
+    quantize: bool = False,
+)
+```
+
+Loads the Gemma transformer weights from a checkpoint into a Kauldron `TrainState`. Only restores the model parameters; optimizer state and step are left as initialized.
+
+<ParamField path="path" type="epath.PathLike" required>
+  Path to the Orbax checkpoint.
+</ParamField>
+
+<ParamField path="quantize" type="bool" default="False">
+  When `True`, the parameter tree is restructured for QAT after loading.
+</ParamField>
+
+```python
+trainer = kd.train.Trainer(
+    init_transforms=[
+        gm.ckpts.LoadCheckpoint(path=gm.ckpts.CheckpointPath.GEMMA3_4B_IT),
+    ],
+    ...
+)
+```
+
+---
+
+### SkipLoRA
+
+```python
+gm.ckpts.SkipLoRA(wrapped: kd.ckpts.InitTransform)
+```
+
+Wraps another init transform and prevents it from overwriting LoRA adapter weights. Useful when resuming a LoRA fine-tuning run from a base checkpoint that does not contain LoRA parameters.
+
+<ParamField path="wrapped" type="kd.ckpts.InitTransform" required>
+  The underlying checkpoint loader to apply after stripping and restoring the LoRA branches.
+</ParamField>
+
+The transform splits the current param tree into `(original, lora)` using `peft.split_params`, applies the wrapped transform to the original params only, then re-merges with `peft.merge_params`.
+
+```python
+gm.ckpts.SkipLoRA(
+    wrapped=gm.ckpts.LoadCheckpoint(path=gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
+)
+```
+
+---
+
+### AnchoredPolicyLoader
+
+```python
+gm.ckpts.AnchoredPolicyLoader(
+    *,
+    policy: kd.ckpts.InitTransform,
+    anchor: kd.ckpts.InitTransform | None = None,
+)
+```
+
+Loads weights for `gm.nn.AnchoredPolicy` models by applying separate loaders for the `policy` and `anchor` sub-models. Must be used together with a model configured as `gm.nn.AnchoredPolicy`.
+
+<ParamField path="policy" type="kd.ckpts.InitTransform" required>
+  Init transform that loads the trainable policy parameters.
+</ParamField>
+
+<ParamField path="anchor" type="kd.ckpts.InitTransform | None" default="None">
+  Init transform that loads the frozen anchor parameters. When `None`, the anchor is initialized as a copy of the policy parameters.
+</ParamField>
+
+---
+
+## CheckpointPath
+
+`gm.ckpts.CheckpointPath` is a `StrEnum` of GCS paths to all official Gemma checkpoints. The naming convention is `{VERSION}_{SIZE}_{VARIANT}` where `PT` = pre-trained and `IT` = instruction-tuned.
+
+<AccordionGroup>
+  <Accordion title="Gemma 2">
+
+| Constant | Value |
+|---|---|
+| `GEMMA2_2B_PT` | `gs://gemma-data/checkpoints/gemma2-2b-pt` |
+| `GEMMA2_2B_IT` | `gs://gemma-data/checkpoints/gemma2-2b-it` |
+| `GEMMA2_9B_PT` | `gs://gemma-data/checkpoints/gemma2-9b-pt` |
+| `GEMMA2_9B_IT` | `gs://gemma-data/checkpoints/gemma2-9b-it` |
+| `GEMMA2_27B_PT` | `gs://gemma-data/checkpoints/gemma2-27b-pt` |
+| `GEMMA2_27B_IT` | `gs://gemma-data/checkpoints/gemma2-27b-it` |
+
+  </Accordion>
+  <Accordion title="Gemma 3">
+
+| Constant | Value |
+|---|---|
+| `GEMMA3_270M_PT` | `gs://gemma-data/checkpoints/gemma3-270m-pt` |
+| `GEMMA3_270M_IT` | `gs://gemma-data/checkpoints/gemma3-270m-it` |
+| `GEMMA3_1B_PT` | `gs://gemma-data/checkpoints/gemma3-1b-pt` |
+| `GEMMA3_1B_IT` | `gs://gemma-data/checkpoints/gemma3-1b-it` |
+| `GEMMA3_4B_PT` | `gs://gemma-data/checkpoints/gemma3-4b-pt` |
+| `GEMMA3_4B_IT` | `gs://gemma-data/checkpoints/gemma3-4b-it` |
+| `GEMMA3_12B_PT` | `gs://gemma-data/checkpoints/gemma3-12b-pt` |
+| `GEMMA3_12B_IT` | `gs://gemma-data/checkpoints/gemma3-12b-it` |
+| `GEMMA3_27B_PT` | `gs://gemma-data/checkpoints/gemma3-27b-pt` |
+| `GEMMA3_27B_IT` | `gs://gemma-data/checkpoints/gemma3-27b-it` |
+
+  </Accordion>
+  <Accordion title="Gemma 3n">
+
+| Constant | Value |
+|---|---|
+| `GEMMA3N_E2B_PT` | `gs://gemma-data/checkpoints/gemma3n-e2b-pt` |
+| `GEMMA3N_E2B_IT` | `gs://gemma-data/checkpoints/gemma3n-e2b-it` |
+| `GEMMA3N_E4B_PT` | `gs://gemma-data/checkpoints/gemma3n-e4b-pt` |
+| `GEMMA3N_E4B_IT` | `gs://gemma-data/checkpoints/gemma3n-e4b-it` |
+
+  </Accordion>
+  <Accordion title="Gemma 4">
+
+| Constant | Value |
+|---|---|
+| `GEMMA4_E2B_PT` | `gs://gemma-data/checkpoints/gemma4-e2b-pt` |
+| `GEMMA4_E2B_IT` | `gs://gemma-data/checkpoints/gemma4-e2b-it` |
+| `GEMMA4_E4B_PT` | `gs://gemma-data/checkpoints/gemma4-e4b-pt` |
+| `GEMMA4_E4B_IT` | `gs://gemma-data/checkpoints/gemma4-e4b-it` |
+| `GEMMA4_26B_A4B_PT` | `gs://gemma-data/checkpoints/gemma4-26b-a4b-pt` |
+| `GEMMA4_26B_A4B_IT` | `gs://gemma-data/checkpoints/gemma4-26b-a4b-it` |
+| `GEMMA4_31B_PT` | `gs://gemma-data/checkpoints/gemma4-31b-pt` |
+| `GEMMA4_31B_IT` | `gs://gemma-data/checkpoints/gemma4-31b-it` |
+
+  </Accordion>
+</AccordionGroup>
+
+Because `CheckpointPath` is a `StrEnum`, values are plain strings and can be passed anywhere a path is accepted:
+
+```python
+params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
+# Equivalent to:
+params = gm.ckpts.load_params('gs://gemma-data/checkpoints/gemma3-4b-it')
+```

@@ -1,0 +1,217 @@
+---
+title: "Download and load Gemma model checkpoints from Kaggle"
+description: "Find every available Gemma checkpoint on Kaggle Hub, download weights manually or with kagglehub, and load them into your model with gm.ckpts."
+---
+
+Gemma model weights are distributed through [Kaggle Hub](https://www.kaggle.com/models/google) as Flax (orbax) checkpoints. The `gm.ckpts` module provides a `CheckpointPath` enum that maps every official checkpoint to its storage location, and `load_params` / `save_params` functions to move weights in and out of memory.
+
+## Downloading from Kaggle Hub
+
+You need a free Kaggle account and must accept the model licence before downloading. Visit the model page for the family you want and click **Agree** on the licence screen.
+
+- [Gemma 4 on Kaggle](https://www.kaggle.com/models/google/gemma-4)
+- [Gemma 3 on Kaggle](https://www.kaggle.com/models/google/gemma-3)
+- [Gemma 2 on Kaggle](https://www.kaggle.com/models/google/gemma-2)
+
+### Manual download
+
+1. Navigate to the model page on Kaggle.
+2. Select the **Flax** variation matching the size and variant you want.
+3. Click **Download** to get the archive.
+4. Extract the archive — it contains the weight directory and `tokenizer.model`.
+
+### Programmatic download
+
+```python
+import kagglehub
+
+kagglehub.login()
+
+# Downloads Gemma 3 4B instruction-tuned weights
+weights_dir = kagglehub.model_download('google/gemma-3/flax/gemma3-4b-it')
+print(weights_dir)
+```
+
+Pass the returned path directly to `gm.ckpts.load_params`:
+
+```python
+from gemma import gm
+
+model = gm.nn.Gemma3_4B()
+params = gm.ckpts.load_params(weights_dir)
+```
+
+## Using CheckpointPath
+
+`gm.ckpts.CheckpointPath` is a `StrEnum` that lists every official checkpoint by name. Passing a `CheckpointPath` value to `load_params` resolves to the corresponding Google Cloud Storage path automatically.
+
+```python
+from gemma import gm
+
+params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
+```
+
+The naming convention is `{VERSION}_{SIZE}_{VARIANT}`:
+- **PT** — pre-trained (base model, not instruction-tuned)
+- **IT** — instruction-tuned (recommended for most use cases)
+
+## Available checkpoints
+
+<Tabs>
+  <Tab title="Gemma 4">
+    Gemma 4 is the latest generation. MoE (mixture-of-experts) variants are labelled with `E` (efficient) or `A` (active parameter count).
+
+    <Note>
+      Gemma 4 Flax checkpoints on Kaggle are updated when available. Use `CheckpointPath` values to get the canonical GCS paths.
+    </Note>
+
+    | Enum value | Size | Variant |
+    |------------|------|---------|
+    | `GEMMA4_E2B_PT` | E2B | Pre-trained |
+    | `GEMMA4_E2B_IT` | E2B | Instruction Tuned |
+    | `GEMMA4_E4B_PT` | E4B | Pre-trained |
+    | `GEMMA4_E4B_IT` | E4B | Instruction Tuned |
+    | `GEMMA4_26B_A4B_PT` | 26B (4B active) | Pre-trained |
+    | `GEMMA4_26B_A4B_IT` | 26B (4B active) | Instruction Tuned |
+    | `GEMMA4_31B_PT` | 31B | Pre-trained |
+    | `GEMMA4_31B_IT` | 31B | Instruction Tuned |
+
+    ```python
+    from gemma import gm
+
+    model = gm.nn.Gemma4_E4B()
+    params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA4_E4B_IT)
+    ```
+  </Tab>
+
+  <Tab title="Gemma 3">
+    Gemma 3 ranges from 270M to 27B parameters and supports vision inputs. IT variants are also available as INT4 quantized checkpoints for reduced memory usage.
+
+    | Enum value | Size | Variant | Quantized |
+    |------------|------|---------|-----------|
+    | `GEMMA3_270M_PT` | 270M | Pre-trained | No |
+    | `GEMMA3_270M_IT` | 270M | Instruction Tuned | No |
+    | `GEMMA3_1B_PT` | 1B | Pre-trained | No |
+    | `GEMMA3_1B_IT` | 1B | Instruction Tuned | No |
+    | `GEMMA3_4B_PT` | 4B | Pre-trained | No |
+    | `GEMMA3_4B_IT` | 4B | Instruction Tuned | No |
+    | `GEMMA3_12B_PT` | 12B | Pre-trained | No |
+    | `GEMMA3_12B_IT` | 12B | Instruction Tuned | No |
+    | `GEMMA3_27B_PT` | 27B | Pre-trained | No |
+    | `GEMMA3_27B_IT` | 27B | Instruction Tuned | No |
+
+    Corresponding Kaggle Hub names: `google/gemma-3/flax/gemma3-{size}-{variant}`, for example `google/gemma-3/flax/gemma3-4b-it`.
+
+    ```python
+    from gemma import gm
+
+    model = gm.nn.Gemma3_4B()
+    params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
+    ```
+  </Tab>
+
+  <Tab title="Gemma 3n">
+    Gemma 3n is an efficient MoE architecture. The current JAX library supports text generation only; vision and audio are not yet available for Gemma 3n.
+
+    | Enum value | Size | Variant |
+    |------------|------|---------|
+    | `GEMMA3N_E2B_PT` | E2B | Pre-trained |
+    | `GEMMA3N_E2B_IT` | E2B | Instruction Tuned |
+    | `GEMMA3N_E4B_PT` | E4B | Pre-trained |
+    | `GEMMA3N_E4B_IT` | E4B | Instruction Tuned |
+
+    ```python
+    from gemma import gm
+
+    model = gm.nn.Gemma3n_E4B()
+    params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3N_E4B_IT)
+    ```
+  </Tab>
+
+  <Tab title="Gemma 2">
+    Gemma 2 is a text-only model available in three sizes.
+
+    | Enum value | Size | Variant |
+    |------------|------|---------|
+    | `GEMMA2_2B_PT` | 2.6B | Pre-trained |
+    | `GEMMA2_2B_IT` | 2.6B | Instruction Tuned |
+    | `GEMMA2_9B_PT` | 9B | Pre-trained |
+    | `GEMMA2_9B_IT` | 9B | Instruction Tuned |
+    | `GEMMA2_27B_PT` | 27B | Pre-trained |
+    | `GEMMA2_27B_IT` | 27B | Instruction Tuned |
+
+    Corresponding Kaggle Hub names: `google/gemma-2/flax/gemma2-{size}-{variant}`, for example `google/gemma-2/flax/gemma2-2b-it`.
+
+    ```python
+    from gemma import gm
+
+    model = gm.nn.Gemma2_2B()
+    params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA2_2B_IT)
+    ```
+  </Tab>
+</Tabs>
+
+## Quantized checkpoints
+
+INT4-quantized variants of the Gemma 3 IT models are available on Kaggle Hub and reduce memory usage by roughly 4×. Download them the same way as other checkpoints, then wrap the model with `gm.nn.IntWrapper` to use integer inference:
+
+```python
+import kagglehub
+from gemma import gm
+
+# Download the INT4 quantized checkpoint
+weights_dir = kagglehub.model_download('google/gemma-3/flax/gemma3-4b-it-int4')
+
+# Use IntWrapper for inference with integer weights
+model = gm.nn.IntWrapper(model=gm.nn.Gemma3_4B())
+params = gm.ckpts.load_params(weights_dir)
+```
+
+Available quantized Kaggle Hub paths:
+
+| Kaggle Hub path | Size |
+|-----------------|------|
+| `google/gemma-3/flax/gemma3-1b-it-int4` | 1B |
+| `google/gemma-3/flax/gemma3-4b-it-int4` | 4B |
+| `google/gemma-3/flax/gemma3-12b-it-int4` | 12B |
+| `google/gemma-3/flax/gemma3-27b-it-int4` | 27B |
+
+<Note>
+  The `quantize=True` parameter in `load_params` is for quantization-aware training (QAT) — it restructures the parameter tree for QAT workflows. It does not load a pre-quantized checkpoint. Use `gm.nn.IntWrapper` with the INT4 Kaggle checkpoints for reduced-memory inference.
+</Note>
+
+## load_params reference
+
+```python
+gm.ckpts.load_params(
+    path,           # CheckpointPath enum value, GCS path, or local directory
+    *,
+    params=None,    # Existing params tree to restore into (preserves sharding)
+    donate=True,    # Release memory from the input params before restoring
+    text_only=False,# Load only text weights, ignore multi-modal params
+    sharding=None,  # ShardingTree for distributed loading (mutually exclusive with params)
+    quantize=False, # Remap params to QAT structure (not for loading pre-quantized checkpoints)
+)
+```
+
+Pass `text_only=True` when you want to load a multi-modal checkpoint but only use the text components, saving memory by skipping the vision encoder weights.
+
+## Saving checkpoints
+
+Use `save_params` to write a checkpoint to disk after fine-tuning:
+
+```python
+from gemma import gm
+
+gm.ckpts.save_params(
+    params,
+    path='/tmp/my-fine-tuned-gemma',
+    wait_until_finished=True,  # Block until the write completes
+)
+```
+
+The saved checkpoint is an [orbax](https://orbax.readthedocs.io/) `StandardCheckpointer` artifact and can be reloaded with `load_params` using the same directory path.
+
+<Tip>
+Set `wait_until_finished=True` in training loops to ensure the checkpoint is fully written before proceeding. The default (`False`) writes asynchronously.
+</Tip>

@@ -1,0 +1,354 @@
+---
+title: "gemma.peft — parameter-efficient fine-tuning API"
+description: "LoRA adapters for Dense, Einsum, and DenseGeneral; simulated and integer quantization wrappers; ModuleInterceptor; quantize; split/merge param utilities."
+---
+
+The `gemma.peft` module provides low-level building blocks for parameter-efficient fine-tuning and quantization of Flax models. The higher-level `gm.nn.LoRA`, `gm.nn.QuantizationAwareWrapper`, and `gm.nn.IntWrapper` classes use these primitives internally, but you can also compose them directly for custom workflows.
+
+## Module interceptors
+
+Interceptors use Flax's `nn.intercept_methods` mechanism to replace submodules at call time without modifying the model definition.
+
+### Interceptor
+
+```python
+gemma.peft.Interceptor
+```
+
+Abstract base class for all interceptors. Subclass it and implement `interceptor(next_fun, args, kwargs, context)`. Use as a context manager:
+
+```python
+with MyInterceptor():
+    y = model(x)
+```
+
+### ModuleInterceptor
+
+```python
+gemma.peft.ModuleInterceptor(replace_module_fn: Callable[[nn.Module], nn.Module])
+```
+
+The general-purpose interceptor used internally by `gm.nn.LoRA` and `gm.nn.QuantizationAwareWrapper`. For every submodule encountered during a forward pass, it calls `replace_module_fn` and substitutes the returned module. Replaced modules are cached so that subsequent calls reuse the same replacement.
+
+<ParamField path="replace_module_fn" type="Callable[[nn.Module], nn.Module]" required>
+  A function that receives an `nn.Module` and returns either the same module (no replacement) or a new module to use in its place.
+</ParamField>
+
+```python
+def replace_dense(module):
+    if isinstance(module, nn.Dense):
+        return peft.LoRADense(rank=4, wrapped=module)
+    return module
+
+with peft.ModuleInterceptor(replace_dense):
+    y = model(x)
+```
+
+---
+
+## LoRA modules
+
+### LoRADenseAdapter
+
+```python
+gemma.peft.LoRADenseAdapter(
+    *,
+    rank: int,
+    features: int,
+    dtype: jnp.dtype = jnp.float_,
+    a_init: Initializer = kaiming_uniform(),
+    b_init: Initializer = zeros_init(),
+)
+```
+
+Standalone LoRA adapter for dense layers. Computes `inputs @ A @ B`. Use `LoRADense` to wrap a complete `nn.Dense` layer instead.
+
+<ParamField path="rank" type="int" required>
+  Rank of the low-rank decomposition.
+</ParamField>
+
+<ParamField path="features" type="int" required>
+  Output dimension of the adapter (must match the wrapped dense layer).
+</ParamField>
+
+<ParamField path="dtype" type="jnp.dtype" default="jnp.float_">
+  Dtype for the A and B matrices.
+</ParamField>
+
+---
+
+### LoRADense
+
+```python
+gemma.peft.LoRADense(
+    *,
+    rank: int,
+    wrapped: nn.Dense,
+    dtype: jnp.dtype = jnp.float_,
+    a_init: Initializer = kaiming_uniform(),
+    b_init: Initializer = zeros_init(),
+)
+```
+
+Wraps `nn.Dense` and adds a LoRA adapter. The wrapped layer and the wrapper share the same Flax scope, so the parameter tree is not nested under an extra level.
+
+<ParamField path="rank" type="int" required>
+  Rank of the LoRA decomposition.
+</ParamField>
+
+<ParamField path="wrapped" type="nn.Dense" required>
+  The original dense layer to augment.
+</ParamField>
+
+---
+
+### LoRAEinsumAdapter
+
+```python
+gemma.peft.LoRAEinsumAdapter(
+    *,
+    rank: int,
+    einsum_str: str,
+    shape: Sequence[int],
+    dtype: jnp.dtype = jnp.float_,
+    a_init: Initializer = kaiming_uniform(),
+    b_init: Initializer = zeros_init(),
+)
+```
+
+Standalone LoRA adapter for einsum operations. Derives the low-rank einsum decomposition from the original `einsum_str` and weight `shape`.
+
+<ParamField path="rank" type="int" required>
+  Rank of the low-rank decomposition.
+</ParamField>
+
+<ParamField path="einsum_str" type="str" required>
+  The original einsum equation, e.g. `'BTNH,NHD->BTD'`. Must be explicit (include `->`) with exactly one comma.
+</ParamField>
+
+<ParamField path="shape" type="Sequence[int]" required>
+  Shape of the original weight tensor (the `NHD` part of the equation above).
+</ParamField>
+
+---
+
+### LoRAEinsum
+
+```python
+gemma.peft.LoRAEinsum(
+    *,
+    rank: int,
+    wrapped: nn.Einsum,
+    dtype: jnp.dtype = jnp.float_,
+    a_init: Initializer = kaiming_uniform(),
+    b_init: Initializer = zeros_init(),
+)
+```
+
+Wraps `nn.Einsum` and adds a LoRA adapter via `LoRAEinsumAdapter`. Shares scope with the wrapped layer.
+
+---
+
+### LoRADenseGeneralAdapter
+
+```python
+gemma.peft.LoRADenseGeneralAdapter(
+    *,
+    rank: int,
+    features: int | Sequence[int],
+    axis: int | Sequence[int],
+    batch_dims: Sequence[int],
+    dtype: jnp.dtype = jnp.float_,
+    a_init: Initializer = kaiming_uniform(),
+    b_init: Initializer = zeros_init(),
+)
+```
+
+Standalone LoRA adapter for `nn.DenseGeneral` layers. Uses `jax.lax.dot_general` to handle arbitrary contraction axes and batch dimensions.
+
+<ParamField path="rank" type="int" required>
+  Rank of the low-rank decomposition.
+</ParamField>
+
+<ParamField path="features" type="int | Sequence[int]" required>
+  Output feature dimension(s).
+</ParamField>
+
+<ParamField path="axis" type="int | Sequence[int]" required>
+  Axes of the input to contract over.
+</ParamField>
+
+<ParamField path="batch_dims" type="Sequence[int]" required>
+  Leading batch axes to preserve without contraction.
+</ParamField>
+
+---
+
+### LoRADenseGeneral
+
+```python
+gemma.peft.LoRADenseGeneral(
+    *,
+    rank: int,
+    wrapped: nn.DenseGeneral,
+    dtype: jnp.dtype = jnp.float_,
+    a_init: Initializer = kaiming_uniform(),
+    b_init: Initializer = zeros_init(),
+)
+```
+
+Wraps `nn.DenseGeneral` and adds a LoRA adapter via `LoRADenseGeneralAdapter`. Shares scope with the wrapped layer.
+
+---
+
+## Param tree utilities
+
+These functions operate on nested parameter dicts and are used to isolate or merge LoRA weights for checkpoint management.
+
+### split_params
+
+```python
+gemma.peft.split_params(params: dict) -> SplittedParams
+```
+
+Splits a parameter tree into two trees: one containing all non-LoRA leaves (`original`) and one containing only `'lora'` subtrees (`lora`).
+
+Returns a `SplittedParams(original, lora)` named tuple.
+
+```python
+original, lora = peft.split_params(params)
+```
+
+### merge_params
+
+```python
+gemma.peft.merge_params(original: dict, lora: dict) -> dict
+```
+
+Inverse of `split_params`. Merges an original parameter tree with a LoRA parameter tree back into a single nested dict.
+
+```python
+params = peft.merge_params(original, lora)
+```
+
+### fuse_params / unfuse_params
+
+```python
+gemma.peft.fuse_params()
+gemma.peft.unfuse_params()
+```
+
+<Note>Not yet implemented. These functions raise `NotImplementedError`.</Note>
+
+---
+
+## Quantization
+
+### QuantizationMethod
+
+```python
+gemma.peft.QuantizationMethod
+```
+
+String enum controlling which quantization scheme is applied.
+
+| Value | Description |
+|---|---|
+| `NONE` | No quantization. |
+| `INT4` | 4-bit uniform per-channel quantization. |
+| `INT8` | 8-bit uniform per-channel quantization. |
+| `Q4_0` | 4-bit per-block quantization. |
+| `Q4_0_TRANSPOSE` | 4-bit per-block with transposed first MLP layer. |
+| `SFP8` | 8-bit floating-point quantization. |
+
+---
+
+### quantize
+
+```python
+gemma.peft.quantize(
+    params: PyTree,
+    *,
+    method: QuantizationMethod | str,
+    checkpoint_kernel_key: str = 'w',
+    in_place_keys: bool = False,
+) -> PyTree
+```
+
+Converts a parameter tree to integer-quantized values. Supports `INT4` and `INT8`; other methods raise `ValueError`.
+
+<ParamField path="params" type="PyTree" required>
+  The parameter tree to quantize.
+</ParamField>
+
+<ParamField path="method" type="QuantizationMethod | str" required>
+  The quantization method to apply.
+</ParamField>
+
+<ParamField path="checkpoint_kernel_key" type="str" default="'w'">
+  The key under which kernel weights are stored in the checkpoint. Official Gemma checkpoints use `'w'`.
+</ParamField>
+
+<ParamField path="in_place_keys" type="bool" default="False">
+  When `True`, replaces the kernel key with `'kernel'` and `'scale'` in the same dict. When `False`, stores quantized weights under a new `_IntEinsum_*` key.
+</ParamField>
+
+---
+
+### simulate_quantize
+
+```python
+gemma.peft.simulate_quantize(kernel: Array, method: QuantizationMethod) -> Array
+```
+
+Applies simulated (straight-through) quantization to a single weight array. Used internally by `SimulateQuantizedDense` and `SimulateQuantizedEinsum` during QAT.
+
+---
+
+### SimulateQuantizedDense
+
+```python
+gemma.peft.SimulateQuantizedDense(wrapped: nn.Dense, method: QuantizationMethod)
+```
+
+Drop-in replacement for `nn.Dense` that applies `simulate_quantize` to the kernel during the forward pass. Used by `gm.nn.QuantizationAwareWrapper`.
+
+---
+
+### SimulateQuantizedEinsum
+
+```python
+gemma.peft.SimulateQuantizedEinsum(wrapped: nn.Einsum, method: QuantizationMethod)
+```
+
+Drop-in replacement for `nn.Einsum` that applies `simulate_quantize` to the weight during the forward pass.
+
+---
+
+### IntDense
+
+```python
+gemma.peft.IntDense(wrapped: nn.Dense, dtype: jnp.dtype = jnp.int4)
+```
+
+Drop-in replacement for `nn.Dense` that stores weights in integer dtype and multiplies by a learned scale during the forward pass. Used by `gm.nn.IntWrapper`.
+
+---
+
+### IntEinsum
+
+```python
+gemma.peft.IntEinsum(wrapped: nn.Einsum, dtype: jnp.dtype = jnp.int4)
+```
+
+Drop-in replacement for `nn.Einsum` that stores weights in integer dtype with a per-channel scale.
+
+---
+
+### get_axis_to_reduce_from_einsum_str
+
+```python
+gemma.peft.get_axis_to_reduce_from_einsum_str(einsum_str: str) -> tuple[int, ...] | None
+```
+
+Utility that parses an einsum equation and returns the weight axes to reduce over when computing per-channel quantization scales. Used internally by `IntEinsum` and related classes.

@@ -1,0 +1,348 @@
+---
+title: "gm.text — samplers, tokenizers, and sampling methods"
+description: "ChatSampler, Sampler, Gemma4Sampler, ToolSampler; Greedy, RandomSampling, TopkSampling, TopPSampling; and Gemma 2/3/3n/4 tokenizers with SpecialTokens."
+---
+
+The `gm.text` module provides everything needed to generate text from a Gemma model: high-level samplers that manage the KV cache and decode tokens, tokenizer classes for each model family, and composable sampling strategies that control how the next token is chosen at each step.
+
+## Samplers
+
+### ChatSampler
+
+`ChatSampler` is the recommended interface for interactive and multi-turn text generation. It is stateful: the KV cache is stored between calls so you do not need to re-encode previous turns manually.
+
+```python
+gm.text.ChatSampler(
+    *,
+    model: TransformerLike,
+    params: Params,
+    multi_turn: bool = False,
+    print_stream: bool | dialog.Stream = False,
+    tokenizer: Tokenizer = None,
+    sampling: SamplingMethod = Greedy(),
+    forbidden_tokens: Sequence[str | int] | None = None,
+    stop_tokens: Sequence[str | int] | None = None,
+    cache_length: int | None = 4096,
+    max_out_length: int = 2048,
+    pad_length: None | int | tuple[int, ...] = (256, 512, 1024),
+    patch_size: int = 16,
+    max_soft_tokens: int = 1120,
+    pooling_kernel_size: int = 3,
+    audio_sample_rate: int = 16000,
+    audio_seq_length: int = 750,
+)
+```
+
+<ParamField path="model" type="TransformerLike" required>
+  Any Gemma model or wrapper that implements the `TransformerLike` protocol.
+</ParamField>
+
+<ParamField path="params" type="Params" required>
+  Model parameters as returned by `gm.ckpts.load_params`.
+</ParamField>
+
+<ParamField path="multi_turn" type="bool" default="False">
+  When `True`, the KV cache state from the previous call to `.chat()` is reused, enabling multi-turn conversation.
+</ParamField>
+
+<ParamField path="print_stream" type="bool | dialog.Stream" default="False">
+  When `True`, tokens are printed to stdout as they are generated.
+</ParamField>
+
+<ParamField path="tokenizer" type="Tokenizer" default="None">
+  Tokenizer to use. When `None`, the correct tokenizer is inferred from `model.INFO.tokenizer_version`.
+</ParamField>
+
+<ParamField path="sampling" type="SamplingMethod" default="Greedy()">
+  Sampling strategy. Defaults to deterministic greedy decoding.
+</ParamField>
+
+<ParamField path="forbidden_tokens" type="Sequence[str | int] | None" default="None">
+  Tokens that are never generated. String values must map to a single token id.
+</ParamField>
+
+<ParamField path="stop_tokens" type="Sequence[str | int] | None" default="None">
+  Tokens that terminate generation when produced.
+</ParamField>
+
+<ParamField path="cache_length" type="int | None" default="4096">
+  Total token budget for the conversation, including all turns, prompts, answers, and image tokens. A fixed value avoids JIT recompilation across turns.
+</ParamField>
+
+<ParamField path="max_out_length" type="int" default="2048">
+  Static output buffer length for a single turn. Must be at least as large as the longest expected response.
+</ParamField>
+
+<ParamField path="pad_length" type="None | int | tuple[int, ...]" default="(256, 512, 1024)">
+  Static pad lengths for inputs (Gemma 4 only). Pads prompts to one of these fixed lengths to avoid JIT recompilation.
+</ParamField>
+
+<ParamField path="patch_size" type="int" default="16">
+  Vision patch size in pixels (Gemma 4 only).
+</ParamField>
+
+<ParamField path="max_soft_tokens" type="int" default="1120">
+  Maximum number of soft vision tokens per image (Gemma 4 only).
+</ParamField>
+
+<ParamField path="audio_sample_rate" type="int" default="16000">
+  Audio sample rate in Hz (Gemma 4 only).
+</ParamField>
+
+<ParamField path="audio_seq_length" type="int" default="750">
+  Maximum audio sequence length in frames (Gemma 4 only).
+</ParamField>
+
+**Example:**
+
+```python
+sampler = gm.text.ChatSampler(model=model, params=params, multi_turn=True)
+
+reply0 = sampler.chat('Write a poem about the ocean.')
+reply1 = sampler.chat('Now make it rhyme.')
+reply2 = sampler.chat('Which stanza do you prefer?')
+```
+
+---
+
+### Sampler
+
+`Sampler` is the lower-level, stateless interface. The caller is responsible for formatting prompts (including `<start_of_turn>` tags) and propagating the `SamplingState` between turns if needed.
+
+```python
+gm.text.Sampler(
+    *,
+    model: TransformerLike,
+    params: Params,
+    tokenizer: Tokenizer = None,
+    sampling: SamplingMethod = Greedy(),
+    forbidden_tokens: Sequence[str | int] | None = None,
+    stop_tokens: Sequence[str | int] | None = None,
+    cache_length: int = 4096,
+    max_out_length: int = 2048,
+    pad_length: None | int | tuple[int, ...] = (256, 512, 1024),
+)
+```
+
+<ParamField path="model" type="TransformerLike" required>
+  Gemma model or any object satisfying the `TransformerLike` protocol.
+</ParamField>
+
+<ParamField path="params" type="Params" required>
+  Model parameters.
+</ParamField>
+
+<ParamField path="tokenizer" type="Tokenizer" default="None">
+  Tokenizer. Inferred from `model.INFO.tokenizer_version` when not provided.
+</ParamField>
+
+<ParamField path="sampling" type="SamplingMethod" default="Greedy()">
+  Default sampling strategy. Can be overridden per call via `sampler.sample(..., sampling=...)`.
+</ParamField>
+
+<ParamField path="forbidden_tokens" type="Sequence[str | int] | None" default="None">
+  Tokens that are never generated.
+</ParamField>
+
+<ParamField path="stop_tokens" type="Sequence[str | int] | None" default="None">
+  Tokens that terminate generation.
+</ParamField>
+
+<ParamField path="cache_length" type="int" default="4096">
+  KV cache length. Must be at least as large as the total input plus output token count.
+</ParamField>
+
+<ParamField path="max_out_length" type="int" default="2048">
+  Static output buffer size per call.
+</ParamField>
+
+<ParamField path="pad_length" type="None | int | tuple[int, ...]" default="(256, 512, 1024)">
+  Static pad lengths for the prompt to avoid JIT recompilation when prompt lengths vary.
+</ParamField>
+
+**`sample()` method:**
+
+```python
+sampler.sample(
+    prompt,                          # str | list[str] | dialog.Conversation | ...
+    *,
+    images=None,                     # UInt8['N? H W C'] | None
+    max_new_tokens: int | None = None,
+    stream: bool = False,
+    sampling: SamplingMethod = None,
+    rng: PRNGKeyLike | None = None,
+    return_state: bool = False,
+    last_state: SamplingState | None = None,
+    sharding=None,
+) -> str | list[str] | SamplerOutput
+```
+
+Accepts a single string, a list of strings, a `dialog.Conversation`, or a list of conversations. Returns a string (or list of strings) when `return_state=False`, or a `SamplerOutput` with the full state when `return_state=True`.
+
+---
+
+### Gemma4Sampler
+
+`gm.text.Gemma4Sampler` is the specialized sampler for Gemma 4 models. It handles variable aspect-ratio image encoding and audio inputs. `ChatSampler` automatically delegates to `Gemma4Sampler` when it detects a Gemma 4 tokenizer version — you typically do not need to use this class directly.
+
+---
+
+### ToolSampler
+
+`gm.text.ToolSampler` extends the base sampler to pause generation at `<begin_of_tool_response>` tokens, enabling function-call workflows where the host application inserts tool results before generation continues.
+
+---
+
+## Sampling methods
+
+All sampling methods extend `SamplingMethod` and implement a single method:
+
+```python
+get_next_tokens(logits: Float['*B V'], rng: PRNGKey) -> Int['*B']
+```
+
+### SamplingMethod
+
+Abstract base class. Subclass this to implement custom decoding strategies.
+
+### Greedy
+
+```python
+gm.text.Greedy()
+```
+
+Returns `argmax(logits)` at each step. Deterministic; `rng` is ignored.
+
+### RandomSampling
+
+```python
+gm.text.RandomSampling(*, temperature: float = 1.0)
+```
+
+Samples from the full softmax distribution after temperature scaling.
+
+<ParamField path="temperature" type="float" default="1.0">
+  Scales logits before softmax. Values below 1.0 sharpen the distribution; values above 1.0 flatten it.
+</ParamField>
+
+### TopkSampling
+
+```python
+gm.text.TopkSampling(*, temperature: float = 1.0, k: int = 1)
+```
+
+Samples from the top-k logits after temperature scaling. Logits outside the top-k are discarded before sampling.
+
+<ParamField path="temperature" type="float" default="1.0">
+  Temperature scaling applied to the top-k logits before sampling.
+</ParamField>
+
+<ParamField path="k" type="int" default="1">
+  Number of top candidates to retain.
+</ParamField>
+
+### TopPSampling
+
+```python
+gm.text.TopPSampling(*, p: float = 0.9, temperature: float = 1.0)
+```
+
+Nucleus (top-p) sampling. Retains the smallest set of tokens whose cumulative probability exceeds `p`, then samples from that set.
+
+<ParamField path="p" type="float" default="0.9">
+  Cumulative probability threshold. Set to `1.0` to disable nucleus filtering (equivalent to `RandomSampling`).
+</ParamField>
+
+<ParamField path="temperature" type="float" default="1.0">
+  Temperature scaling applied before nucleus filtering.
+</ParamField>
+
+---
+
+## Tokenizers
+
+All tokenizer classes extend `Tokenizer` and are frozen dataclasses. The correct class is automatically selected by `Sampler` and `ChatSampler` based on `model.INFO.tokenizer_version`.
+
+### Tokenizer
+
+Base class. Wraps a SentencePiece model and exposes encode/decode operations.
+
+```python
+gm.text.Tokenizer(
+    path: epath.PathLike,
+    custom_tokens: dict[int, str] = {},
+)
+```
+
+<ParamField path="path" type="epath.PathLike" required>
+  Path to the `.model` SentencePiece vocabulary file.
+</ParamField>
+
+<ParamField path="custom_tokens" type="dict[int, str]" default="{}">
+  Overrides for unused token slots (ids 0–98). Maps the unused slot index to the desired token string.
+</ParamField>
+
+Key methods and properties:
+
+| Member | Description |
+|---|---|
+| `encode(text, *, add_bos=False, add_eos=False)` | Encodes a string or list of pre-split tokens to token ids. |
+| `decode(ids)` | Decodes a token id or array to a string. |
+| `split(text)` | Splits text into SentencePiece pieces without encoding to ids. |
+| `vocab_size` | Number of tokens in the vocabulary. |
+| `tokens` | List of all vocabulary strings. |
+| `special_tokens` | `SpecialTokens` enum with ids for `PAD`, `EOS`, `BOS`, etc. |
+| `from_version(version)` | Class method; returns the correct tokenizer for version `2`, `3`, `'3n'`, or `4`. |
+
+### Gemma2Tokenizer
+
+```python
+gm.text.Gemma2Tokenizer()
+```
+
+Tokenizer for Gemma 2 models (`VERSION = 2`). Loads from `gs://gemma-data/tokenizers/tokenizer_gemma2.model`.
+
+### Gemma3Tokenizer
+
+```python
+gm.text.Gemma3Tokenizer()
+```
+
+Tokenizer for Gemma 3 models (`VERSION = 3`). Forbids generation of `START_OF_IMAGE` and `END_OF_IMAGE` tokens by default.
+
+### Gemma3nTokenizer
+
+```python
+gm.text.Gemma3nTokenizer()
+```
+
+Tokenizer for Gemma 3n models (`VERSION = '3n'`). Uses the same special token set as Gemma 3.
+
+### Gemma4Tokenizer
+
+```python
+gm.text.Gemma4Tokenizer()
+```
+
+Tokenizer for Gemma 4 models (`VERSION = 4`). Uses the `dialog.Format.GEMMA4` prompt format and includes additional special tokens for image and audio (`IMAGE_PLACEHOLDER`, `AUDIO_PLACEHOLDER`, `START_OF_AUDIO`, `END_OF_AUDIO`).
+
+### SpecialTokens
+
+`gm.text.SpecialTokens` is an `IntEnum` base class that defines the token id slots common to all tokenizer versions:
+
+| Name | Description |
+|---|---|
+| `PAD` | Padding token |
+| `EOS` | End of sequence |
+| `BOS` | Beginning of sequence |
+| `UNK` | Unknown token |
+| `MASK` | Mask token |
+| `START_OF_TURN` | `<start_of_turn>` |
+| `END_OF_TURN` | `<end_of_turn>` |
+| `IMAGE_PLACEHOLDER` | Image placeholder (multimodal models) |
+| `START_OF_IMAGE` | Start of image token |
+| `END_OF_IMAGE` | End of image token |
+| `AUDIO_PLACEHOLDER` | Audio placeholder (Gemma 4 only) |
+| `BEGIN_OF_TOOL_RESPONSE` | Tool response delimiter |
+
+Concrete ids differ by tokenizer version. Access via `tokenizer.special_tokens.EOS`, etc.

@@ -1,0 +1,159 @@
+---
+title: "Multi-modal inference with images and audio in Gemma"
+description: "Pass images and audio alongside text to Gemma 3, 3n, and 4 models using ChatSampler — including multi-turn conversations with per-turn visual context."
+---
+
+Gemma's multi-modal capability lets you interleave image and audio tokens directly in a prompt alongside text. The `<|image|>` and `<|audio|>` placeholder tokens mark where each modality is injected, and `gm.text.ChatSampler` handles the preprocessing and token expansion automatically. No changes to the sampler construction are required — you just pass `images=` or `audio=` to `.chat()`.
+
+## Model support
+
+<CardGroup cols={2}>
+  <Card title="Images — Gemma 3, 3n, 4" icon="image">
+    All Gemma 3, 3n, and 4 instruction-tuned models support image input via the `<|image|>` token. Place one token in the prompt for each image you supply.
+  </Card>
+  <Card title="Audio — Gemma 4 only" icon="audio-lines">
+    Audio input is supported exclusively by Gemma 4 models. Use the `<|audio|>` token as a placeholder and pass raw audio arrays to `audio=`.
+  </Card>
+</CardGroup>
+
+<Note>
+  The `<|image|>` and `<|audio|>` tokens are the canonical API tokens. `ChatSampler` automatically converts them to the correct internal format for the underlying model version.
+</Note>
+
+## Image input
+
+### Accepted formats
+
+- **NumPy arrays** — uint8 arrays of shape `(H, W, C)` for a single image, or a list of such arrays for multiple images.
+- **PIL Images** — `PIL.Image.Image` objects of any size (Gemma 4 only; Gemma 3 requires arrays pre-resized to a consistent shape).
+
+### Single image
+
+Add the `<|image|>` token at the position in your prompt where the image should be referenced, then pass the image array to `images=`:
+
+```python
+import numpy as np
+from gemma import gm
+
+model = gm.nn.Gemma3_4B()
+params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
+
+sampler = gm.text.ChatSampler(
+    model=model,
+    params=params,
+)
+
+# image is a numpy uint8 array of shape (H, W, 3)
+output = sampler.chat(
+    "What can you say about this image: <|image|>",
+    images=image,
+)
+print(output)
+```
+
+### Multiple images
+
+Pass a list of images to `images=` and place one `<|image|>` token in the prompt for each:
+
+```python
+output = sampler.chat(
+    "Compare these two images: <|image|> and <|image|>.",
+    images=[image1, image2],
+)
+```
+
+<Warning>
+  For Gemma 3 and 3n, all images in a batch must be resized to the same spatial dimensions before being stacked. Gemma 4 accepts variable-aspect-ratio images natively — each is preprocessed and patchified independently by `Gemma4Sampler`.
+</Warning>
+
+## Audio input (Gemma 4 only)
+
+Pass a list of raw float32 audio arrays sampled at `audio_sample_rate` (default 16 000 Hz). Use `<|audio|>` as the placeholder token:
+
+```python
+model = gm.nn.Gemma4_E4B()
+params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA4_E4B_IT)
+
+sampler = gm.text.ChatSampler(
+    model=model,
+    params=params,
+    audio_sample_rate=16000,  # default; change if your audio is at a different rate
+)
+
+# audio_array is a 1-D float32 numpy array of raw samples
+output = sampler.chat(
+    "Transcribe the following audio: <|audio|>",
+    audio=[audio_array],
+)
+print(output)
+```
+
+If the sampled lengths of audio clips differ (e.g. multiple clips in one call), you can pass explicit lengths:
+
+```python
+output = sampler.chat(
+    "Compare these two recordings: <|audio|> and <|audio|>",
+    audio=[clip1, clip2],
+    audio_lengths=[len(clip1), len(clip2)],
+)
+```
+
+## Multi-turn multi-modal conversations
+
+`ChatSampler` preserves the KV-cache between turns, so you can supply different images in each call of a multi-turn conversation:
+
+```python
+sampler = gm.text.ChatSampler(
+    model=model,
+    params=params,
+    multi_turn=True,
+)
+
+out0 = sampler.chat("Describe this image. <|image|>", images=[img1])
+out1 = sampler.chat("Now describe this one. <|image|>", images=[img2])
+out2 = sampler.chat("Which of the two scenes looks more peaceful, and why?")
+```
+
+Each turn's image tokens are appended to the shared KV-cache. Keep `cache_length` large enough to hold all token types (text + image patches) across all turns.
+
+## Gemma 4 vision parameters
+
+These fields on `ChatSampler` control how Gemma 4 preprocesses images. They are ignored for Gemma 2/3/3n models.
+
+<ParamField path="patch_size" type="int" default="16">
+  Size of each image patch in pixels. Determines how the image is divided before being fed to the vision encoder.
+</ParamField>
+
+<ParamField path="max_soft_tokens" type="int" default="1120">
+  Maximum number of soft (image) tokens allocated per image after patchification and pooling. Larger values allow richer image representations but consume more cache capacity.
+</ParamField>
+
+<ParamField path="pooling_kernel_size" type="int" default="3">
+  Kernel size used when pooling patch embeddings. Controls how aggressively spatial information is compressed before the tokens are injected into the text sequence.
+</ParamField>
+
+<ParamField path="audio_sample_rate" type="int" default="16000">
+  Sample rate of the input audio in Hz. Must match the sample rate of the arrays passed to `audio=`. Gemma 4 was trained at 16 000 Hz.
+</ParamField>
+
+<ParamField path="audio_seq_length" type="int" default="750">
+  Maximum number of audio tokens computed from one audio clip. Clips that would produce more tokens are truncated to this length.
+</ParamField>
+
+## Legacy Gemma 3 format tokens
+
+Earlier versions of the library used `<start_of_image>` as the image placeholder token for Gemma 3 models. This format is now deprecated. The unified API uses `<|image|>` for all model versions.
+
+<Warning>
+  Using `<start_of_image>` in a prompt will raise a `DeprecationWarning` for Gemma 3 models and a hard `ValueError` for Gemma 4 models. Migrate all prompts to `<|image|>`.
+</Warning>
+
+```python
+# Deprecated — do not use
+out = sampler.chat("What is this? <start_of_image>", images=image)
+
+# Correct — use <|image|> for all model versions
+out = sampler.chat("What is this? <|image|>", images=image)
+```
+
+`ChatSampler` converts `<|image|>` to `<start_of_image>` internally when it detects a Gemma 3 model, so the new token form is safe to use for both Gemma 3 and Gemma 4.

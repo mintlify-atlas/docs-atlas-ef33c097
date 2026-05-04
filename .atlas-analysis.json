@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Gemma",
+  "projectType": "ai-ml",
+  "projectName": "Gemma",
+  "projectDescription": "A JAX-based Python library for running and fine-tuning Google DeepMind's Gemma family of open-weight large language models.",
   "theme": "palm",
-  "colors": {
-    "primary": "#5d6c75",
-    "light": "#b5bec1"
-  },
-  "favicon": "https://media.brand.dev/09c17e3d-55bc-4496-b57d-c47425543ebb.png",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/google-deepmind/gemma"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/google-deepmind/gemma"
-    }
-  },
+  "primaryColor": "#5d6c75",
+  "lightColor": "#b5bec1",
+  "darkColor": null,
   "navigation": {
     "tabs": [
       {
@@ -79,5 +67,29 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Unified ChatSampler API compatible with Gemma 2, 3, 3n, and 4 model families",
+    "Multi-modal inference supporting text, images, and audio inputs",
+    "LoRA and PEFT fine-tuning with quantization-aware training",
+    "Multi-device sharding via JAX for CPU, GPU, and TPU",
+    "Tool use / function calling via MCP integration",
+    "Pre-trained and instruction-tuned checkpoints from Gemma 2 through Gemma 4"
+  ],
+  "publicApiSurface": [
+    "gm.nn.Gemma2_2B / Gemma2_9B / Gemma2_27B",
+    "gm.nn.Gemma3_1B / Gemma3_4B / Gemma3_12B / Gemma3_27B",
+    "gm.nn.Gemma3n_E2B / Gemma3n_E4B",
+    "gm.nn.Gemma4_E2B / Gemma4_E4B / Gemma4_31B / Gemma4_26B_A4B",
+    "gm.nn.LoRA",
+    "gm.nn.Transformer / TransformerLike",
+    "gm.text.ChatSampler",
+    "gm.text.Sampler",
+    "gm.text.ToolSampler",
+    "gm.text.Greedy / RandomSampling / TopkSampling / TopPSampling",
+    "gm.text.Gemma2Tokenizer / Gemma3Tokenizer / Gemma4Tokenizer",
+    "gm.ckpts.load_params / save_params",
+    "gm.ckpts.CheckpointPath",
+    "gm.ckpts.LoadCheckpoint"
+  ]
 }

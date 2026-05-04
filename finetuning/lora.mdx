@@ -1,0 +1,208 @@
+---
+title: "LoRA fine-tuning for Gemma models"
+description: "Use low-rank adaptation to fine-tune Gemma in JAX with a fraction of the memory, training only small adapter matrices instead of the full model."
+---
+
+LoRA (Low-Rank Adaptation) fine-tunes large language models by adding pairs of small trainable matrices — called adapters — to each linear layer, while keeping the original pre-trained weights frozen. Because the adapter matrices are much smaller than the original weights, the optimizer state is tiny and GPU/TPU memory requirements drop dramatically compared to full fine-tuning.
+
+In the Gemma JAX library, LoRA is exposed through the `gm.nn.LoRA` wrapper. Wrapping any Gemma model with `gm.nn.LoRA` automatically replaces every compatible linear layer (`nn.Dense`, `nn.Einsum`, `nn.DenseGeneral`) with its LoRA variant and keeps the parameter namespace identical to the unwrapped model, so existing checkpoint loading code requires only a single extra wrapper.
+
+## How `gm.nn.LoRA` works
+
+`gm.nn.LoRA` is a thin Flax `nn.Module` that shares its Flax scope with the wrapped model (so the parameter tree looks like `{'params': model_params}` rather than `{'params': {'model': model_params}}`). At call time it installs a `peft.ModuleInterceptor` that replaces each supported linear layer with its LoRA counterpart before the forward pass runs.
+
+```python
+# gemma/gm/nn/_lora.py
+
+class LoRA(nn.Module):
+    rank: int
+    model: nn.Module
+    dtype: jnp.dtype = jnp.bfloat16
+    verbose: bool = False
+
+    @nn.compact
+    def __call__(self, *args, **kwargs):
+        replace_module_fn = functools.partial(
+            _replace_by_lora,
+            rank=self.rank,
+            dtype=self.dtype,
+            verbose=self.verbose,
+        )
+        with peft.ModuleInterceptor(replace_module_fn):
+            return self.model(*args, **kwargs)
+```
+
+The `rank` parameter controls the bottleneck dimension of the adapter matrices. Smaller ranks use less memory; larger ranks allow the adapter to capture more of the fine-tuning signal. A rank of 4 is a common starting point.
+
+## Applying LoRA to a model
+
+Wrap the model in `gm.nn.LoRA` before passing it to the trainer. Everything else — dataset, loss, evaluators — stays the same as a full fine-tuning config.
+
+```python
+# examples/lora.py
+
+model=gm.nn.LoRA(
+    rank=4,
+    model=gm.nn.Gemma3_4B(
+        tokens="batch.input",
+        text_only=True,
+    ),
+),
+```
+
+<Note>
+At the time of writing, LoRA fine-tuning with multimodal inputs is not yet supported. Pass `text_only=True` to the inner model when using LoRA.
+</Note>
+
+## Loading the pre-trained checkpoint
+
+The original pre-trained checkpoint does not contain LoRA adapter weights. Wrap the checkpoint loader with `gm.ckpts.SkipLoRA` so it loads only the base model parameters and leaves the adapter weights to be initialised from scratch.
+
+```python
+# examples/lora.py
+
+init_transform=gm.ckpts.SkipLoRA(
+    wrapped=gm.ckpts.LoadCheckpoint(
+        path=gm.ckpts.CheckpointPath.GEMMA3_4B_IT,
+    )
+),
+```
+
+`SkipLoRA` is transparent: it passes every parameter key that does not contain `lora` to the inner loader and silently skips the rest, allowing Flax to initialise the adapter weights using the standard Flax parameter initialisation path.
+
+## Training only the adapter weights
+
+Use `kd.optim.partial_updates` to restrict the optimizer to the LoRA parameters. The `mask=kd.optim.select("lora")` argument matches any parameter path that contains the string `"lora"`, which is exactly where the adapter matrices live.
+
+```python
+# examples/lora.py
+
+optimizer=kd.optim.partial_updates(
+    optax.adafactor(learning_rate=0.005),
+    # Only optimize the LoRA weights. The rest of the model is frozen.
+    mask=kd.optim.select("lora"),
+),
+```
+
+Because the base model weights receive zero gradient updates, they do not need optimizer state, which further reduces memory consumption.
+
+## Complete LoRA training config
+
+Putting it all together, here is the full trainer configuration from `examples/lora.py`:
+
+```python
+# examples/lora.py
+
+def get_config():
+    batch_size = 16
+    max_length = 512
+
+    return kd.train.Trainer(
+        seed=42,
+        train_ds=_make_dataset(
+            training=True,
+            batch_size=batch_size,
+            max_length=max_length,
+        ),
+        # 1. Wrap the model with LoRA adapters.
+        model=gm.nn.LoRA(
+            rank=4,
+            model=gm.nn.Gemma3_4B(
+                tokens="batch.input",
+                text_only=True,
+            ),
+        ),
+        # 2. Load only the non-LoRA weights from the checkpoint.
+        init_transform=gm.ckpts.SkipLoRA(
+            wrapped=gm.ckpts.LoadCheckpoint(
+                path=gm.ckpts.CheckpointPath.GEMMA3_4B_IT,
+            )
+        ),
+        num_train_steps=10_000,
+        train_losses={
+            "xentropy": kd.losses.SoftmaxCrossEntropyWithIntLabels(
+                logits="preds.logits",
+                labels="batch.target",
+                mask="batch.loss_mask",
+            ),
+        },
+        # 3. Restrict the optimizer to LoRA weights only.
+        optimizer=kd.optim.partial_updates(
+            optax.adafactor(learning_rate=0.005),
+            mask=kd.optim.select("lora"),
+        ),
+        checkpointer=kd.ckpts.Checkpointer(
+            save_interval_steps=500,
+        ),
+        evals={
+            "test": kd.evals.Evaluator(
+                run=kd.evals.EveryNSteps(1000),
+                ds=_make_dataset(
+                    training=False,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                ),
+            ),
+            "sampling": gm.evals.SamplerEvaluator(
+                run=kd.evals.EveryNSteps(1000),
+                max_new_tokens=150,
+                num_batches=1,
+                ds=_make_dataset(training=False, sampling=True),
+            ),
+        },
+    )
+```
+
+## Saving and loading LoRA checkpoints
+
+Kauldron's `kd.ckpts.Checkpointer` saves the full parameter tree, including both the frozen base weights and the trained adapter weights, at each checkpoint interval. No special handling is required for saving.
+
+When you want to **resume training** from a saved LoRA checkpoint (which already contains the adapter weights), use the plain `gm.ckpts.LoadCheckpoint` loader without `SkipLoRA`:
+
+```python
+init_transform=gm.ckpts.LoadCheckpoint(
+    path="/path/to/lora_checkpoint",
+),
+```
+
+When you want to **initialise from the original pre-trained base model** and train LoRA from scratch, wrap with `SkipLoRA` as shown above.
+
+## Inspecting which layers receive LoRA adapters
+
+Set `verbose=True` on the `gm.nn.LoRA` wrapper to log a diagnostic line for every layer that is replaced:
+
+```python
+model=gm.nn.LoRA(
+    rank=4,
+    verbose=True,
+    model=gm.nn.Gemma3_4B(...),
+),
+```
+
+The log output will contain lines like:
+
+```
+[LoRA] Dense (q_proj) <- transformer/layer_0/attn/q_proj
+[LoRA] Einsum (kv_proj) <- transformer/layer_0/attn/kv_proj
+```
+
+## Supported linear layer types
+
+`gm.nn.LoRA` automatically wraps the following Flax module types when it encounters them inside the wrapped model:
+
+| Original module | LoRA wrapper |
+|---|---|
+| `nn.Dense` | `peft.LoRADense` |
+| `nn.Einsum` | `peft.LoRAEinsum` |
+| `nn.DenseGeneral` | `peft.LoRADenseGeneral` |
+| `gemma._layers.Einsum` | `_LoRAEinsum` (internal) |
+
+For lower-level control over which layers receive adapters, use the `gemma.peft` module directly.
+
+## Running the example
+
+```bash
+python -m kauldron.main \
+    --cfg=examples/lora.py \
+    --cfg.workdir=/tmp/kauldron_oss/workdir
+```

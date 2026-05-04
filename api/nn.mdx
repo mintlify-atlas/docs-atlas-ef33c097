@@ -1,0 +1,406 @@
+---
+title: "gm.nn — Gemma model classes and building blocks"
+description: "Gemma 2, 3, 3n, and 4 model classes; LoRA, quantization, and AnchoredPolicy wrappers; Attention, Block, FeedForward, Embedder, RMSNorm, Einsum, and Cache."
+---
+
+The `gm.nn` module is the primary entry point for Gemma model architectures. It exposes ready-to-use model classes for every supported checkpoint family, wrapper classes that modify model behavior without changing parameters, and the individual transformer building blocks needed to construct custom architectures.
+
+## Model classes
+
+All model classes extend `Transformer` and carry a frozen `config` attribute that encodes the exact hyperparameters for that checkpoint family. You typically do not instantiate them directly — the samplers and checkpoint loaders accept any `TransformerLike`.
+
+<AccordionGroup>
+  <Accordion title="Gemma 2">
+
+| Class | Parameters | Layers | Heads / KV heads | Head dim |
+|---|---|---|---|---|
+| `Gemma2_2B` | ~2 B | 26 | 8 / 4 | 256 |
+| `Gemma2_9B` | ~9 B | 42 | 16 / 8 | 256 |
+| `Gemma2_27B` | ~27 B | 46 | 32 / 16 | 128 |
+
+All three models use alternating `LOCAL_SLIDING` / `GLOBAL` attention, `use_post_attn_norm=True`, `use_post_ffw_norm=True`, sliding window 4096, and `attn_logits_soft_cap=50.0`.
+
+```python
+import gemma.gm.nn as gm_nn
+
+model = gm_nn.Gemma2_2B()
+```
+
+  </Accordion>
+  <Accordion title="Gemma 3">
+
+| Class | Parameters | Layers | Heads / KV heads | Head dim | Vision |
+|---|---|---|---|---|---|
+| `Gemma3_270M` | ~270 M | 18 | 4 / 1 | 256 | No |
+| `Gemma3_1B` | ~1 B | 26 | 4 / 1 | 256 | No |
+| `Gemma3_4B` | ~4 B | 34 | 8 / 4 | 256 | Yes |
+| `Gemma3_12B` | ~12 B | 48 | 16 / 8 | 256 | Yes |
+| `Gemma3_27B` | ~27 B | 62 | 32 / 16 | 128 | Yes |
+
+Gemma 3 models use a 5-local-1-global attention pattern and `use_qk_norm=True`. The 4B, 12B, and 27B variants include a `SigLiPFromPatches` vision encoder and expose a `text_only: bool = False` attribute to disable it.
+
+```python
+model = gm_nn.Gemma3_4B()                     # multimodal
+model_text = gm_nn.Gemma3_4B(text_only=True)  # text only
+```
+
+  </Accordion>
+  <Accordion title="Gemma 3n">
+
+| Class | Effective params | Layers |
+|---|---|---|
+| `Gemma3n_E2B` | ~2 B effective | 30 |
+| `Gemma3n_E4B` | ~4 B effective | 35 |
+
+Gemma 3n models are mixture-of-experts variants with shared embed dimension of 2048. The current JAX library supports text generation only for Gemma 3n; vision and audio are not yet available.
+
+  </Accordion>
+  <Accordion title="Gemma 4">
+
+| Class | Description |
+|---|---|
+| `Gemma4_E2B` | ~2 B effective, multimodal (vision + audio) |
+| `Gemma4_E4B` | ~4 B effective, multimodal (vision + audio) |
+| `Gemma4_31B` | ~31 B dense, multimodal |
+| `Gemma4_26B_A4B` | ~26 B MoE with ~4 B active params |
+
+All Gemma 4 models default to `text_only=True`. Set `text_only=False` to enable the vision and audio encoders.
+
+```python
+model = gm_nn.Gemma4_E4B(text_only=False)  # enable vision + audio
+```
+
+  </Accordion>
+</AccordionGroup>
+
+## Wrapper classes
+
+Wrappers intercept module calls and replace inner layers transparently. The wrapped model's parameter structure is shared via `nn.share_scope`, so the parameter tree is not nested under an extra level.
+
+### LoRA
+
+```python
+gm_nn.LoRA(*, rank: int, model: nn.Module, dtype: jnp.dtype = jnp.bfloat16, verbose: bool = False)
+```
+
+Wraps a Gemma model and replaces every `nn.Dense`, `nn.Einsum`, and `nn.DenseGeneral` layer with its LoRA equivalent from `gemma.peft`.
+
+<ParamField path="rank" type="int" required>
+  Rank of the LoRA decomposition. Controls the size of the low-rank matrices A and B.
+</ParamField>
+
+<ParamField path="model" type="nn.Module" required>
+  The Gemma model to wrap.
+</ParamField>
+
+<ParamField path="dtype" type="jnp.dtype" default="jnp.bfloat16">
+  Dtype for the LoRA weight matrices A and B.
+</ParamField>
+
+<ParamField path="verbose" type="bool" default="False">
+  When `True`, logs a diagnostic string for every layer that is replaced.
+</ParamField>
+
+```python
+model = gm_nn.LoRA(rank=4, model=gm_nn.Gemma3_4B())
+```
+
+### QuantizationAwareWrapper
+
+```python
+gm_nn.QuantizationAwareWrapper(*, method: peft.QuantizationMethod = peft.QuantizationMethod.NONE, model: nn.Module)
+```
+
+Enables quantization-aware training (QAT) by replacing linear layers with simulated-quantization equivalents from `gemma.peft`.
+
+<ParamField path="method" type="QuantizationMethod" default="QuantizationMethod.NONE">
+  Quantization method. One of `NONE`, `INT4`, `INT8`, `Q4_0`, `Q4_0_TRANSPOSE`, or `SFP8`.
+</ParamField>
+
+<ParamField path="model" type="nn.Module" required>
+  The Gemma model to wrap.
+</ParamField>
+
+### IntWrapper
+
+```python
+gm_nn.IntWrapper(*, model: nn.Module, dtype: jnp.dtype = jnp.int4)
+```
+
+Enables integer inference by replacing linear layers with integer versions. Use this at inference time with a checkpoint produced by `QuantizationAwareWrapper` training.
+
+<ParamField path="model" type="nn.Module" required>
+  The Gemma model to wrap.
+</ParamField>
+
+<ParamField path="dtype" type="jnp.dtype" default="jnp.int4">
+  Integer dtype for the kernel weights. Typically `jnp.int4` or `jnp.int8`.
+</ParamField>
+
+### AnchoredPolicy
+
+```python
+gm_nn.AnchoredPolicy(policy: nn.Module, anchor: nn.Module | None = None)
+```
+
+Wraps two models — a trainable `policy` and a frozen `anchor` — for DPO-style contrastive losses. When `anchor` is `None` the policy weights are copied at initialization.
+
+<ParamField path="policy" type="nn.Module" required>
+  The model being trained.
+</ParamField>
+
+<ParamField path="anchor" type="nn.Module | None" default="None">
+  The frozen reference model. If `None`, a copy of `policy` is used at initialization via `gm.ckpts.AnchoredPolicyLoader`.
+</ParamField>
+
+The forward pass returns `AnchoredPolicyOutput(policy=..., anchor=...)` where `anchor` has `jax.lax.stop_gradient` applied.
+
+## Transformer base classes
+
+### Transformer
+
+`gm.nn.Transformer` is the base class for all Gemma model classes. You can subclass it to define custom architectures.
+
+<ParamField path="config" type="TransformerConfig" required>
+  Frozen dataclass containing all hyperparameters: `num_embed`, `embed_dim`, `hidden_dim`, `num_heads`, `head_dim`, `num_kv_heads`, `attention_types`, and more.
+</ParamField>
+
+<ParamField path="return_last_only" type="bool | None" default="None">
+  If `True`, only the logits for the last input token are computed and returned. Useful during autoregressive decoding.
+</ParamField>
+
+<ParamField path="dtype" type="jnp.dtype" default="jnp.bfloat16">
+  Parameter dtype. Vision encoder and LoRA parameters are excluded and kept at their native dtype.
+</ParamField>
+
+<ParamField path="tokens" type="kontext.Key">
+  Kauldron context key used to locate token ids in the batch.
+</ParamField>
+
+<ParamField path="images" type="kontext.Key | None" default="None">
+  Kauldron context key used to locate image arrays in the batch. Only relevant for multimodal models.
+</ParamField>
+
+**Forward pass:**
+
+```python
+output: gm.nn.Output = model.apply(
+    {'params': params},
+    tokens,           # Int['*B L']
+    images=images,    # UInt8['*B N H W C'] | None
+    cache=cache,      # Cache | None
+    return_last_only=True,
+)
+# output.logits     : Float['*B V'] when return_last_only=True
+# output.cache      : updated Cache | None
+# output.hidden_states : Float['*B L D'] | None
+```
+
+### TransformerLike
+
+`gm.nn.TransformerLike` is the structural protocol that `gm.text.Sampler` and `gm.text.ChatSampler` accept. Any class that implements the expected `__call__` signature and exposes `INFO`, `config`, and `init_cache` is compatible.
+
+## Transformer building blocks
+
+These classes are exported for users who want to build custom architectures on top of Gemma components.
+
+### Attention
+
+```python
+gm_nn.Attention(
+    num_heads: int,
+    num_kv_heads: int,
+    features: int,
+    head_dim: int,
+    attn_type: AttentionType,
+    query_pre_attn_scalar: float,
+    rope_base_frequency: int = 10_000,
+    rope_scale_factor: float = 1.0,
+    attn_logits_soft_cap: float | None = None,
+    sliding_window_size: int | None = None,
+    use_qk_norm: bool = False,
+)
+```
+
+Multi-head attention with optional grouped-query attention (GQA), rotary position embeddings (RoPE), soft logit capping, and sliding-window masking.
+
+<ParamField path="num_heads" type="int" required>
+  Number of query heads.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="int" required>
+  Number of key/value heads. When `num_kv_heads == num_heads` a fused QKV einsum is used; when `num_kv_heads > 1` and `num_kv_heads != num_heads` grouped-query attention is used.
+</ParamField>
+
+<ParamField path="features" type="int" required>
+  Input/output feature dimension (equals `embed_dim`).
+</ParamField>
+
+<ParamField path="head_dim" type="int" required>
+  Dimension per attention head.
+</ParamField>
+
+<ParamField path="attn_type" type="AttentionType" required>
+  `AttentionType.GLOBAL` for full attention or `AttentionType.LOCAL_SLIDING` for sliding-window attention.
+</ParamField>
+
+<ParamField path="query_pre_attn_scalar" type="float" required>
+  Scalar applied to queries before computing attention logits.
+</ParamField>
+
+<ParamField path="sliding_window_size" type="int | None" default="None">
+  Required when `attn_type=LOCAL_SLIDING`. Defines the one-sided window radius.
+</ParamField>
+
+### Block
+
+```python
+gm_nn.Block(
+    num_heads: int,
+    num_kv_heads: int,
+    embed_dim: int,
+    head_dim: int,
+    hidden_dim: int,
+    use_post_attn_norm: bool,
+    use_post_ffw_norm: bool,
+    attn_type: AttentionType,
+    query_pre_attn_scalar: float,
+    transpose_gating_einsum: bool,
+    rope_base_frequency: int = 10_000,
+    rope_scale_factor: float = 1.0,
+    attn_logits_soft_cap: float | None = None,
+    sliding_window_size: int | None = None,
+    use_qk_norm: bool = False,
+)
+```
+
+A full transformer block consisting of pre-attention RMSNorm, `Attention`, optional post-attention RMSNorm, pre-FFW RMSNorm, `FeedForward`, and optional post-FFW RMSNorm.
+
+### FeedForward
+
+```python
+gm_nn.FeedForward(features: int, hidden_dim: int, transpose_gating_einsum: bool)
+```
+
+Gated feedforward network using `GELU` activation. Uses two `Einsum` layers sharing scope with the enclosing `Block`.
+
+<ParamField path="features" type="int" required>
+  Input and output feature dimension (`embed_dim`).
+</ParamField>
+
+<ParamField path="hidden_dim" type="int" required>
+  Width of the hidden projection.
+</ParamField>
+
+<ParamField path="transpose_gating_einsum" type="bool" required>
+  Controls the einsum axis ordering of the gating projection. Set to match the checkpoint.
+</ParamField>
+
+### Embedder
+
+```python
+gm_nn.Embedder(vocab_size: int, embed_dim: int, vision_proj_dim: int | None = None)
+```
+
+Token embedding and un-embedding table. For multimodal models, also contains the projection from SigLiP to text embedding space.
+
+<ParamField path="vocab_size" type="int" required>
+  Vocabulary size.
+</ParamField>
+
+<ParamField path="embed_dim" type="int" required>
+  Embedding dimension.
+</ParamField>
+
+<ParamField path="vision_proj_dim" type="int | None" default="None">
+  When set, adds `mm_soft_embedding_norm` and `mm_input_projection` submodules for projecting vision encoder output.
+</ParamField>
+
+### RMSNorm
+
+```python
+gm_nn.RMSNorm()
+```
+
+Root-mean-square layer normalization. Learns a single `scale` parameter of shape `(D,)`. Applied as `x * rsqrt(mean(x²) + 1e-6) * (1 + scale)`.
+
+### Einsum
+
+```python
+gm_nn.Einsum(shape: tuple[int, ...], weight_name: str = 'w', initializer=nn.initializers.normal(), dtype: jnp.dtype | None = None)
+```
+
+Parameterized einsum. Stores a weight of the given `shape` and applies it via a caller-specified einsum equation string.
+
+<ParamField path="shape" type="tuple[int, ...]" required>
+  Shape of the weight parameter.
+</ParamField>
+
+<ParamField path="weight_name" type="str" default="'w'">
+  Name used to store the weight in the Flax variable collection.
+</ParamField>
+
+### AttentionType
+
+```python
+gm_nn.AttentionType.GLOBAL
+gm_nn.AttentionType.LOCAL_SLIDING
+```
+
+Enum controlling whether a layer uses full (global) attention or sliding-window (local) attention.
+
+### Cache
+
+```python
+gm_nn.Cache  # dict[str, LayerCache]
+```
+
+Type alias for the KV cache. A `Cache` is a `dict` mapping layer names (e.g. `'layer_0'`) to per-layer caches containing `'k'`, `'v'`, `'end_index'`, and `'positions'` arrays.
+
+Create a cache with:
+
+```python
+cache = model.init_cache(batch_size=1, dtype=jnp.bfloat16, cache_length=4096)
+```
+
+## Output types
+
+### Output
+
+```python
+gm_nn.Output(logits, cache, hidden_states)
+```
+
+Return type of `Transformer.__call__`.
+
+<ParamField path="logits" type="Float['*B L V'] | Float['*B V']">
+  Predicted logits. Shape is `*B V` when `return_last_only=True`, otherwise `*B L V`.
+</ParamField>
+
+<ParamField path="cache" type="Cache | None">
+  Updated KV cache. `None` when no cache was passed to the forward call.
+</ParamField>
+
+<ParamField path="hidden_states" type="Float['*B L D'] | Float['*B D'] | None">
+  Final-layer hidden states, returned only when `return_hidden_states=True`.
+</ParamField>
+
+### AnchoredPolicyOutput
+
+```python
+gm_nn.AnchoredPolicyOutput(policy, anchor)
+```
+
+Return type of `AnchoredPolicy.__call__`. `policy` is the output of the trainable model; `anchor` is the output of the frozen reference model with `stop_gradient` applied.
+
+## Vision encoder
+
+### SigLiPFromPatches
+
+```python
+gm_nn.SigLiPFromPatches()
+```
+
+The SigLiP vision encoder used in Gemma 3 (4B, 12B, 27B) and Gemma 3n models. Encodes image patches into soft token embeddings that are fused with text embeddings inside `Transformer._merge_mm_embeddings`.
+
+It is embedded into the model config via `config.vision_encoder` and is typically accessed as `model.vision_encoder`. You do not need to call it directly.

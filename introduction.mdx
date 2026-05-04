@@ -1,0 +1,58 @@
+---
+title: "Gemma JAX: open-weight LLM library by Google DeepMind"
+description: "Gemma is Google DeepMind's open-weight LLM family. This JAX library covers inference, fine-tuning, and multi-modal models across CPU, GPU, and TPU."
+---
+
+Gemma is a family of open-weight large language models built by Google DeepMind, based on the same research and technology behind Gemini. This library—the [`gemma`](https://pypi.org/project/gemma/) PyPI package—is the official JAX implementation, giving you full access to model weights, inference, fine-tuning, and multi-modal capabilities across the entire Gemma lineage.
+
+## Model families
+
+The library supports four generations of Gemma models, each available in pre-trained (PT) and instruction-tuned (IT) variants.
+
+| Family | Sizes | Multi-modal | Notes |
+|--------|-------|-------------|-------|
+| Gemma 2 | 2B, 9B, 27B | No | Stable, text-only generation |
+| Gemma 3 | 270M, 1B, 4B, 12B, 27B | Yes (vision) | INT4 quantized checkpoints available |
+| Gemma 3n | E2B, E4B | Text only (JAX) | Efficient MoE architecture; vision/audio not yet in JAX library |
+| Gemma 4 | E2B, E4B, 26B-A4B, 31B | Yes (vision + audio) | Latest generation; MoE variants |
+
+The same `ChatSampler` API works uniformly across all model versions, so code written for Gemma 2 runs on Gemma 4 with a one-line change.
+
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="Inference" icon="play">
+    Run single-turn or multi-turn conversations with `gm.text.ChatSampler`. Supports streaming, batching, and greedy or sampled decoding.
+  </Card>
+  <Card title="Fine-tuning" icon="sliders">
+    Full fine-tuning and LoRA via `gm.nn.LoRA` and `gm.losses`. Integrates with the Kauldron training framework for distributed runs.
+  </Card>
+  <Card title="Sharding" icon="server">
+    Built-in tensor and data parallelism through `gm.sharding`. Distribute large models across multiple GPU or TPU devices with minimal code.
+  </Card>
+  <Card title="Tool use" icon="wrench">
+    Native MCP (Model Context Protocol) tool-use support via `gm.tools`, backed by `fastmcp` and `mcp` integrations.
+  </Card>
+  <Card title="Multi-modal" icon="image">
+    Vision and audio inputs work through a unified `<|image|>` token syntax in prompts. Gemma 3, 3n, and 4 all support image inputs.
+  </Card>
+  <Card title="Quantization" icon="gauge">
+    INT4 quantized checkpoints for Gemma 3 IT models reduce memory requirements roughly four-fold with minimal quality loss.
+  </Card>
+</CardGroup>
+
+## System requirements
+
+- **Python:** 3.12 or newer
+- **JAX:** Install separately for your target hardware (CPU, CUDA GPU, or TPU) before installing `gemma`
+- **GPU RAM:** 8 GB or more for 2B models; 24 GB or more for 7B+ models
+- **Accelerators:** CPU, NVIDIA GPU (CUDA), Google TPU — all supported via JAX
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install the library and run your first inference in minutes.
+  </Card>
+  <Card title="Checkpoints" icon="download" href="/checkpoints">
+    Download model weights from Kaggle Hub and load them with `gm.ckpts`.
+  </Card>
+</CardGroup>

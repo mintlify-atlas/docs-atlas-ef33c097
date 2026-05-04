@@ -1,0 +1,333 @@
+---
+title: "gm.data — data pipeline utilities for Gemma training"
+description: "Parquet data source; Seq2SeqTask and ContrastiveTask; DecodeBytes, FormatText, Tokenize, Pad, MapInts element transforms; and make_seq2seq_fields and pad."
+---
+
+The `gm.data` module provides a collection of PyGrain-compatible data sources and transforms for building training pipelines with Gemma. It covers everything from loading raw data from Parquet files to creating the token sequences and loss masks required for sequence-to-sequence fine-tuning and contrastive (DPO-style) training.
+
+## Data sources
+
+### Parquet
+
+```python
+gm.data.Parquet(*, path: epath.PathLike | list[epath.PathLike])
+```
+
+A `kd.data.py.DataSourceBase` that reads from one or more Parquet files. Wraps a `pyarrow.parquet` reader and exposes each row as a plain Python `dict`.
+
+<ParamField path="path" type="epath.PathLike | list[epath.PathLike]" required>
+  Path or list of paths to the Parquet file(s). Accepts any path type accepted by `etils.epath`, including GCS URIs.
+</ParamField>
+
+```python
+ds = kd.data.py.PyGrainPipeline(
+    data_source=gm.data.Parquet(path='gs://my-bucket/data/train.parquet'),
+    transformations=[...],
+)
+```
+
+---
+
+## End-to-end task transforms
+
+These transforms handle the full conversion from raw text fields to model-ready token arrays.
+
+### Seq2SeqTask
+
+```python
+gm.data.Seq2SeqTask(
+    *,
+    in_prompt: kd.kontext.Key,
+    in_response: kd.kontext.Key,
+    out_input: kd.kontext.Key,
+    out_target: kd.kontext.Key,
+    out_target_mask: kd.kontext.Key,
+    tokenizer: Tokenizer,
+    max_length: int,
+    truncate: bool = False,
+    drop_inputs: bool = True,
+    sampling: bool = False,
+)
+```
+
+Converts a `{prompt, response}` example into the `{input, target, target_mask}` arrays needed for next-token-prediction training. The transform:
+
+1. Formats prompt and response with the Gemma dialog template (`<start_of_turn>user`, `<end_of_turn>`, etc.).
+2. Tokenizes both strings.
+3. Concatenates them to form `input` (prompt + response, minus last token) and `target` (prompt + response, shifted right by one).
+4. Creates `target_mask` (0 for prompt tokens, 1 for response tokens).
+5. Pads or truncates to `max_length`.
+
+When `sampling=True`, the task skips tokenization and emits the raw formatted strings instead. This mode is required by `gm.evals.SamplerEvaluator`.
+
+<ParamField path="in_prompt" type="kd.kontext.Key" required>
+  Dict key for the raw prompt string in the input example.
+</ParamField>
+
+<ParamField path="in_response" type="kd.kontext.Key" required>
+  Dict key for the raw response string in the input example.
+</ParamField>
+
+<ParamField path="out_input" type="kd.kontext.Key" required>
+  Dict key under which the tokenized input sequence is written.
+</ParamField>
+
+<ParamField path="out_target" type="kd.kontext.Key" required>
+  Dict key under which the tokenized target sequence is written. Shape: `[max_length, 1]`.
+</ParamField>
+
+<ParamField path="out_target_mask" type="kd.kontext.Key" required>
+  Dict key under which the boolean loss mask is written. Shape: `[max_length, 1]`.
+</ParamField>
+
+<ParamField path="tokenizer" type="Tokenizer" required>
+  Tokenizer to use for encoding.
+</ParamField>
+
+<ParamField path="max_length" type="int" required>
+  Sequence length to pad or truncate to.
+</ParamField>
+
+<ParamField path="truncate" type="bool" default="False">
+  When `True`, sequences longer than `max_length` are silently truncated. When `False`, an error is raised.
+</ParamField>
+
+<ParamField path="drop_inputs" type="bool" default="True">
+  When `True`, `in_prompt` and `in_response` are removed from the output dict.
+</ParamField>
+
+<ParamField path="sampling" type="bool" default="False">
+  When `True`, tokenization is skipped and formatted strings are emitted for use with `gm.evals.SamplerEvaluator`.
+</ParamField>
+
+**Example:**
+
+```python
+task = gm.data.Seq2SeqTask(
+    in_prompt='prompt',
+    in_response='response',
+    out_input='input',
+    out_target='target',
+    out_target_mask='target_mask',
+    tokenizer=gm.text.Gemma3Tokenizer(),
+    max_length=2048,
+)
+```
+
+---
+
+### ContrastiveTask
+
+```python
+gm.data.ContrastiveTask(
+    *,
+    in_prompt: kd.kontext.Key,
+    in_chosen: kd.kontext.Key,
+    in_rejected: kd.kontext.Key,
+    out_tokens: kd.kontext.Key,
+    out_targets: kd.kontext.Key,
+    out_mask: kd.kontext.Key,
+    tokenizer: Tokenizer,
+    max_length: int,
+    truncate: bool = False,
+    drop_inputs: bool = True,
+)
+```
+
+Creates the contrastive token arrays required for DPO-style training. Takes a `{prompt, chosen, rejected}` example and produces stacked `[2, max_length]` arrays where index 0 is the chosen response and index 1 is the rejected response.
+
+<ParamField path="in_prompt" type="kd.kontext.Key" required>
+  Dict key for the raw prompt string.
+</ParamField>
+
+<ParamField path="in_chosen" type="kd.kontext.Key" required>
+  Dict key for the preferred (chosen) response string.
+</ParamField>
+
+<ParamField path="in_rejected" type="kd.kontext.Key" required>
+  Dict key for the dispreferred (rejected) response string.
+</ParamField>
+
+<ParamField path="out_tokens" type="kd.kontext.Key" required>
+  Output key for stacked input tokens. Shape: `[2, max_length]`.
+</ParamField>
+
+<ParamField path="out_targets" type="kd.kontext.Key" required>
+  Output key for stacked target tokens. Shape: `[2, max_length]`.
+</ParamField>
+
+<ParamField path="out_mask" type="kd.kontext.Key" required>
+  Output key for stacked loss masks. Shape: `[2, max_length]`.
+</ParamField>
+
+<ParamField path="tokenizer" type="Tokenizer" required>
+  Tokenizer to use.
+</ParamField>
+
+<ParamField path="max_length" type="int" required>
+  Sequence length for each of the two stacked sequences.
+</ParamField>
+
+<ParamField path="truncate" type="bool" default="False">
+  When `True`, sequences are truncated to `max_length`.
+</ParamField>
+
+<ParamField path="drop_inputs" type="bool" default="True">
+  When `True`, removes `in_prompt`, `in_chosen`, and `in_rejected` from the output.
+</ParamField>
+
+---
+
+## Per-element transforms
+
+These are `kd.data.ElementWiseTransform` subclasses that operate on individual fields. Use them in the `transformations=` list of a PyGrain pipeline.
+
+### DecodeBytes
+
+```python
+gm.data.DecodeBytes(*, encoding: str = 'utf-8')
+```
+
+Decodes a `bytes` field to a `str`. Required when reading from TFDS or other sources that return byte strings.
+
+<ParamField path="encoding" type="str" default="'utf-8'">
+  Text encoding to use when decoding.
+</ParamField>
+
+---
+
+### FormatText
+
+```python
+gm.data.FormatText(*, template: str)
+```
+
+Applies a string template containing a `{text}` placeholder to each element. The template is automatically de-dented with `textwrap.dedent`.
+
+<ParamField path="template" type="str" required>
+  Format string containing `{text}`. For example: `'Question: {text}\nAnswer:'`.
+</ParamField>
+
+---
+
+### Tokenize
+
+```python
+gm.data.Tokenize(*, tokenizer: Tokenizer, add_eos: bool = False, add_bos: bool = False)
+```
+
+Tokenizes a string field using a `gm.text.Tokenizer`.
+
+<ParamField path="tokenizer" type="Tokenizer" required>
+  Tokenizer instance to use.
+</ParamField>
+
+<ParamField path="add_eos" type="bool" default="False">
+  Append the EOS token to each sequence.
+</ParamField>
+
+<ParamField path="add_bos" type="bool" default="False">
+  Prepend the BOS token to each sequence.
+</ParamField>
+
+---
+
+### Pad
+
+```python
+gm.data.Pad(*, max_length: int, truncate: bool = False)
+```
+
+Zero-pads a token sequence to a fixed length. Works on arrays or lists.
+
+<ParamField path="max_length" type="int" required>
+  Target sequence length.
+</ParamField>
+
+<ParamField path="truncate" type="bool" default="False">
+  When `True`, truncates sequences that exceed `max_length`.
+</ParamField>
+
+---
+
+### MapInts
+
+```python
+gm.data.MapInts(*, old_to_new: dict[int, int])
+```
+
+Replaces each integer value in a field according to a lookup table. Raises `KeyError` if the value is not found in the mapping.
+
+<ParamField path="old_to_new" type="dict[int, int]" required>
+  Mapping from old integer values to new integer values.
+</ParamField>
+
+---
+
+### AddSeq2SeqFields
+
+```python
+gm.data.AddSeq2SeqFields(
+    *,
+    in_prompt: kd.kontext.Key,
+    in_response: kd.kontext.Key,
+    out_input: kd.kontext.Key,
+    out_target: kd.kontext.Key,
+    out_target_mask: kd.kontext.Key,
+)
+```
+
+Lower-level transform that builds `input`, `target`, and `target_mask` from already-tokenized prompt and response token id arrays. Does not apply any formatting or tokenization.
+
+<ParamField path="in_prompt" type="kd.kontext.Key" required>
+  Dict key for the pre-tokenized prompt token ids.
+</ParamField>
+
+<ParamField path="in_response" type="kd.kontext.Key" required>
+  Dict key for the pre-tokenized response token ids.
+</ParamField>
+
+<ParamField path="out_input" type="kd.kontext.Key" required>
+  Output key for the concatenated input sequence.
+</ParamField>
+
+<ParamField path="out_target" type="kd.kontext.Key" required>
+  Output key for the shifted target sequence.
+</ParamField>
+
+<ParamField path="out_target_mask" type="kd.kontext.Key" required>
+  Output key for the response-only loss mask.
+</ParamField>
+
+---
+
+## Functional API
+
+These functions are called by the transforms above and are also available for use in custom pipelines.
+
+### make_seq2seq_fields
+
+```python
+gm.data.make_seq2seq_fields(
+    prompt: list[int],
+    response: list[int],
+) -> NamedTuple(input, target, target_mask)
+```
+
+Given pre-tokenized prompt and response lists, returns a named tuple with:
+
+- `input`: prompt + response[:-1]
+- `target`: prompt[1:] + response (shifted left by one token)
+- `target_mask`: 0 for prompt positions, 1 for response positions
+
+### pad
+
+```python
+gm.data.pad(
+    sequence,
+    max_length: int,
+    truncate: bool = False,
+) -> array
+```
+
+Pads a sequence (list, array, or a structure of lists/arrays) with zeros to `max_length`. When `truncate=True`, silently clips to `max_length`; otherwise raises an error if the input is longer.

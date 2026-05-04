@@ -1,0 +1,157 @@
+---
+title: "Scaling Gemma across GPUs and TPUs with JAX sharding"
+description: "Distribute Gemma model parameters and KV cache across multiple devices using JAX and Kauldron sharding strategies for large-scale training and inference."
+---
+
+JAX's device mesh abstraction lets you spread tensor data across multiple GPUs or TPUs so that a single model forward pass is executed in parallel across all devices. Gemma integrates with this system through the Kauldron `kd.sharding` API, which lets you declare how parameters and activations should be distributed without writing low-level `jax.sharding` primitives by hand.
+
+## How JAX sharding works with Gemma
+
+JAX represents distributed arrays using `jax.sharding.Sharding` objects that describe which devices hold which slices of a tensor. When you run a jitted function, XLA partitions the computation automatically based on these annotations.
+
+Gemma's `Transformer.init_cache` already accepts a `sharding` argument so that KV cache arrays are placed on devices according to your sharding plan:
+
+```python
+cache = model.init_cache(
+    batch_size=4,
+    dtype=jnp.bfloat16,
+    cache_length=512,
+    sharding=my_sharding_tree,
+)
+```
+
+For training, sharding is declared at the `Trainer` level in Kauldron so that the framework handles constraint propagation for both parameters and activations.
+
+## Using `kd.sharding.ShardingStrategy`
+
+The `sharding` field on `kd.train.Trainer` accepts a `kd.sharding.ShardingStrategy` that specifies how model parameters are partitioned. The most common strategy for large models is **Fully Sharded Data Parallel (FSDP)**, which shards each parameter tensor across all available devices.
+
+```python
+from kauldron import kd
+
+trainer = kd.train.Trainer(
+    ...
+    sharding=kd.sharding.ShardingStrategy(
+        params=kd.sharding.FSDPSharding(),
+    ),
+)
+```
+
+With FSDP, each device holds a shard of every weight matrix. During the forward and backward passes, JAX all-gathers the full tensor on demand and immediately discards the gathered copy to keep peak memory low.
+
+## Complete sharding example
+
+The following is adapted from `examples/sharding.py`. It is identical to a standard fine-tuning configuration except for the `sharding=` field:
+
+```python
+from kauldron import konfig
+
+with konfig.imports():
+    from gemma import gm
+    from kauldron import kd
+    import optax
+
+
+def get_config():
+    batch_size = 16
+    max_length = 512
+
+    return kd.train.Trainer(
+        seed=42,
+        train_ds=_make_dataset(
+            training=True,
+            batch_size=batch_size,
+            max_length=max_length,
+        ),
+        model=gm.nn.Gemma3_4B(
+            tokens="batch.input",
+        ),
+        # Shard model parameters with FSDP across all visible devices.
+        sharding=kd.sharding.ShardingStrategy(
+            params=kd.sharding.FSDPSharding(),
+        ),
+        init_transform=gm.ckpts.LoadCheckpoint(
+            path=gm.ckpts.CheckpointPath.GEMMA3_4B_IT,
+        ),
+        num_train_steps=10_000,
+        train_losses={
+            "xentropy": kd.losses.SoftmaxCrossEntropyWithIntLabels(
+                logits="preds.logits",
+                labels="batch.target",
+                mask="batch.loss_mask",
+            ),
+        },
+        optimizer=optax.adafactor(learning_rate=1e-3),
+        checkpointer=kd.ckpts.Checkpointer(
+            save_interval_steps=500,
+        ),
+    )
+```
+
+Adding `sharding=kd.sharding.ShardingStrategy(params=kd.sharding.FSDPSharding())` is the only change required relative to a single-device training run.
+
+## Sharding the KV cache
+
+During inference, the KV cache can also be distributed across devices. Pass a `sharding` argument to `init_cache` to annotate the cache arrays:
+
+```python
+cache = model.init_cache(
+    batch_size=batch_size,
+    dtype=jnp.bfloat16,
+    cache_length=cache_length,
+    sharding=my_sharding_tree,
+)
+```
+
+`Transformer.init_cache` calls `kd.sharding.with_sharding_constraint` internally when a `sharding` argument is provided, so annotations propagate to all cache tensors (`k`, `v`, `end_index`, `positions`) automatically.
+
+## Supported hardware
+
+<CardGroup cols={2}>
+  <Card title="TPUs" icon="server">
+    Multi-host TPU pods are the primary target for large-scale Gemma training. JAX automatically detects the TPU topology and assigns each device a slice of the mesh.
+  </Card>
+  <Card title="Multi-GPU" icon="gpu">
+    NVIDIA GPUs are supported via JAX's CUDA backend. Set `XLA_FLAGS=--xla_gpu_enable_nccl_threshold_for_collectives` for best NCCL performance on multi-GPU hosts.
+  </Card>
+</CardGroup>
+
+## Running a sharded training job
+
+<Steps>
+  <Step title="Install JAX with the correct backend">
+    Follow the JAX installation guide for your hardware. For TPUs:
+
+    ```bash
+    pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+    ```
+
+    For CUDA GPUs:
+
+    ```bash
+    pip install "jax[cuda12]"
+    ```
+  </Step>
+  <Step title="Verify device visibility">
+    Confirm that JAX sees all expected devices before running training:
+
+    ```python
+    import jax
+    print(jax.devices())  # Should list all TPU cores or GPU devices
+    ```
+  </Step>
+  <Step title="Add sharding to your trainer config">
+    Set `sharding=kd.sharding.ShardingStrategy(params=kd.sharding.FSDPSharding())` in your `kd.train.Trainer` as shown in the example above.
+  </Step>
+  <Step title="Launch with the Kauldron runner">
+    ```bash
+    python -m kauldron.main \
+        --cfg=examples/sharding.py \
+        --cfg.workdir=/tmp/my_workdir
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Sharding configuration has no effect when only one device is visible. The same config file works on a single device, making it straightforward to debug locally before scaling up.
+</Note>

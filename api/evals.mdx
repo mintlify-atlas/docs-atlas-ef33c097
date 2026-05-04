@@ -1,0 +1,115 @@
+---
+title: "gm.evals — evaluation utilities for Gemma"
+description: "SamplerEvaluator runs a Gemma sampler over an eval dataset in the Kauldron loop, collecting generated text with configurable losses and metrics."
+---
+
+The `gm.evals` module provides evaluator classes that plug into the Kauldron training framework. Evaluators are run during training at configurable intervals and write metrics to the configured writer (e.g., TensorBoard or XManager).
+
+## SamplerEvaluator
+
+`SamplerEvaluator` runs a `gm.text.Sampler` over an evaluation dataset and collects text outputs along with any losses or metrics you configure. It expects the dataset to contain a `gm.data.Seq2SeqTask` transform in its pipeline (used to extract the prompt and tokenizer).
+
+```python
+gm.evals.SamplerEvaluator(
+    max_new_tokens: int,
+    *,
+    cache_length: int = 4096,
+    pad_length: int | None = None,
+    num_batches: int | None = None,
+    ds: kd.data.Pipeline = ROOT_CFG_REF.eval_ds,
+    model: nn.Module = ROOT_CFG_REF.model,
+    losses: Mapping[str, kd.losses.Loss] = {},
+    metrics: Mapping[str, kd.metrics.Metric] = {},
+    summaries: Mapping[str, kd.metrics.Metric] = {},
+)
+```
+
+<ParamField path="max_new_tokens" type="int" required>
+  Maximum number of new tokens to generate per example. The model processes `input_length + max_new_tokens` tokens in total.
+</ParamField>
+
+<ParamField path="cache_length" type="int" default="4096">
+  KV cache length. Must be at least `input_length + max_new_tokens`. A fixed value avoids JIT recompilation across evaluation steps.
+</ParamField>
+
+<ParamField path="pad_length" type="int | None" default="None">
+  When set, pads all prompts to this fixed length to avoid JIT recompilation when prompt lengths vary.
+</ParamField>
+
+<ParamField path="num_batches" type="int | None" default="None">
+  Number of batches to sample. When `None`, the full dataset is evaluated. Setting this to a small value is useful during development.
+</ParamField>
+
+<ParamField path="ds" type="kd.data.Pipeline">
+  The evaluation dataset. Defaults to `ROOT_CFG_REF.eval_ds` (resolved at runtime from the trainer config). Must be a `kd.data.py.PyGrainPipeline` containing a `gm.data.Seq2SeqTask` transform.
+</ParamField>
+
+<ParamField path="model" type="nn.Module">
+  The Gemma model. Defaults to `ROOT_CFG_REF.model` (resolved from the trainer config).
+</ParamField>
+
+<ParamField path="losses" type="Mapping[str, kd.losses.Loss]" default="{}">
+  Named losses to compute over the sampled outputs. Losses and metrics can reference the predicted text via the context key `preds.text`.
+</ParamField>
+
+<ParamField path="metrics" type="Mapping[str, kd.metrics.Metric]" default="{}">
+  Named metrics to compute and log.
+</ParamField>
+
+<ParamField path="summaries" type="Mapping[str, kd.metrics.Metric]" default="{}">
+  Additional summaries to write alongside the default prompt/answer/ground-truth text summaries.
+</ParamField>
+
+**Default text summaries**
+
+`SamplerEvaluator` automatically writes three text summaries without any extra configuration:
+
+| Key | Content |
+|---|---|
+| `prompt` | The input prompt string from the dataset. |
+| `answer` | The model's generated text (`preds.text`). |
+| `gt` | The ground-truth response string (only when the dataset provides a target). |
+
+**Dataset requirements**
+
+The `ds` pipeline must:
+
+- Be a `kd.data.py.PyGrainPipeline`.
+- Contain a `gm.data.Seq2SeqTask` transform configured with `sampling=True`. This causes the task to emit raw formatted strings rather than tokenized arrays, which the evaluator then feeds to the sampler.
+
+**Example:**
+
+```python
+eval_ds = kd.data.py.PyGrainPipeline(
+    data_source=gm.data.Parquet(path='gs://my-bucket/data/eval.parquet'),
+    transformations=[
+        gm.data.Seq2SeqTask(
+            in_prompt='prompt',
+            in_response='response',
+            out_input='input',
+            out_target='target',
+            out_target_mask='target_mask',
+            tokenizer=gm.text.Gemma3Tokenizer(),
+            max_length=2048,
+            sampling=True,    # required for SamplerEvaluator
+        ),
+    ],
+)
+
+evaluator = gm.evals.SamplerEvaluator(
+    max_new_tokens=512,
+    cache_length=4096,
+    num_batches=50,
+    ds=eval_ds,
+    metrics={
+        'exact_match': kd.metrics.ExactMatch(
+            targets='batch.target',
+            preds='preds.text',
+        ),
+    },
+)
+```
+
+**Sharding**
+
+When `ds.batch_size` is `None` (unbatched dataset), inputs are replicated across all devices with `kd.sharding.REPLICATED`. When `batch_size` is set, `kd.sharding.FIRST_DIM` sharding is applied, distributing the batch across devices.

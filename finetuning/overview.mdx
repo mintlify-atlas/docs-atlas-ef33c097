@@ -1,0 +1,150 @@
+---
+title: "Fine-tuning Gemma models with JAX"
+description: "Overview of fine-tuning strategies for Gemma in JAX: full fine-tuning, LoRA adapters, and PEFT for every task type and hardware budget."
+---
+
+Fine-tuning adapts a pre-trained Gemma checkpoint to a new task without training from scratch. The Gemma JAX library supports several complementary strategies — from updating every weight in the model to training a small fraction of adapter parameters — so you can match your approach to your hardware budget and task requirements.
+
+## Fine-tuning strategies
+
+Three strategies are available, each with a different trade-off between flexibility and cost.
+
+<CardGroup cols={3}>
+  <Card title="Full fine-tuning" icon="sliders">
+    Updates all model weights. Maximum flexibility and final accuracy, but requires enough GPU/TPU memory to hold both the model and its full optimizer state.
+  </Card>
+  <Card title="LoRA" icon="layers" href="/finetuning/lora">
+    Injects low-rank adapter matrices into every linear layer. Only the adapter weights are trained, cutting memory use dramatically while retaining most of the model's expressive power.
+  </Card>
+  <Card title="gemma.peft" icon="wrench" href="/finetuning/peft">
+    Lower-level module surgery toolkit. Provides the building blocks behind `gm.nn.LoRA` and adds quantization-aware training for INT4/INT8/SFP8 regimes.
+  </Card>
+</CardGroup>
+
+### When to use each approach
+
+| Strategy | Use when |
+|---|---|
+| Full fine-tuning | You have ample accelerator memory and want maximum accuracy on a high-value task. |
+| LoRA (`gm.nn.LoRA`) | You want fast iteration, limited GPU VRAM, or need to maintain multiple task-specific adapters on top of a shared base model. |
+| `gemma.peft` directly | You are building custom PEFT pipelines, need quantization-aware training, or want fine-grained control over which layers receive adapters. |
+
+## Task types supported
+
+Gemma fine-tuning covers four task families, each with a dedicated data-processing helper and a working example script.
+
+### Sequence-to-sequence
+
+The most common task: given a prompt, teach the model to generate a specific response. The `gm.data.Seq2SeqTask` transform tokenizes `(prompt, response)` pairs and produces the `input`, `target`, and `loss_mask` fields that the training loop expects.
+
+```python
+gm.data.Seq2SeqTask(
+    in_prompt="src",
+    in_response="dst",
+    out_input="input",
+    out_target="target",
+    out_target_mask="loss_mask",
+    tokenizer=gm.text.Gemma3Tokenizer(),
+    max_length=512,
+    truncate=True,
+)
+```
+
+See `examples/seq2seq.py` for the full trainer configuration.
+
+### Classification
+
+For classification, the model is asked to output one of a fixed set of tokens rather than a free-form sequence. Set `return_last_only=True` on the model so the final hidden state is used as the classification head, then apply a cross-entropy loss against the target token ID.
+
+```python
+model=gm.nn.Gemma3_4B(
+    tokens="batch.sentence",
+    return_last_only=True,
+),
+```
+
+See `examples/classification.py` for a complete config using the GLUE CoLA benchmark.
+
+### DPO — Direct Preference Optimization
+
+DPO improves the model's alignment by running a preferred and a rejected response through both a trainable policy and a frozen reference model, then applying the DPO loss to increase the likelihood of the preferred answer.
+
+```python
+model=gm.nn.AnchoredPolicy(
+    policy=gm.nn.Gemma3_4B(tokens="batch.tokens", text_only=True),
+),
+init_transform=gm.ckpts.AnchoredPolicyLoader(
+    policy=gm.ckpts.LoadCheckpoint(
+        path=gm.ckpts.CheckpointPath.GEMMA3_4B_IT,
+    ),
+),
+train_losses={
+    "dpo": gm.losses.DpoLoss(
+        tokens="batch.targets",
+        sequence_mask="batch.mask",
+        policy_logits="preds.policy.logits",
+        anchor_logits="preds.anchor.logits",
+    ),
+},
+```
+
+The `gm.nn.AnchoredPolicy` wrapper runs both the policy and the frozen anchor in a single forward pass. `gm.ckpts.AnchoredPolicyLoader` loads the same checkpoint into both branches. See `examples/dpo.py`.
+
+### NPO — Negative Preference Optimization
+
+NPO is an unlearning algorithm derived from DPO. It uses the same `gm.nn.AnchoredPolicy` / `gm.ckpts.AnchoredPolicyLoader` setup but replaces the DPO loss with `gm.losses.NpoLoss`, which only penalises the likelihood of the target sequence relative to the reference model.
+
+```python
+train_losses={
+    "npo": gm.losses.NpoLoss(
+        tokens="batch.target",
+        sequence_mask="batch.mask",
+        policy_logits="preds.policy.logits",
+        anchor_logits="preds.anchor.logits",
+    ),
+},
+```
+
+See `examples/npo.py` for the unlearning setup using the TOFU benchmark.
+
+## Hardware requirements
+
+Larger Gemma models need more device memory. The table below gives rough minimum figures for full fine-tuning with `bfloat16` weights and `adafactor` optimizer state. LoRA reduces the optimizer state to only the adapter parameters and allows training on significantly less memory.
+
+| Model | Full fine-tuning (approx.) | LoRA (rank 4, approx.) |
+|---|---|---|
+| Gemma 3 4B | ~40 GB | ~12 GB |
+| Gemma 3 12B | ~120 GB | ~32 GB |
+
+<Note>
+These figures are approximate and depend on batch size, sequence length, and framework overhead. Use gradient accumulation to reduce per-step memory when training on fewer accelerators.
+</Note>
+
+## Example scripts
+
+Complete, runnable trainer configurations live in the `examples/` directory of the repository. Each is a Kauldron config file that can be launched with:
+
+```bash
+python -m kauldron.main \
+    --cfg=examples/<script>.py \
+    --cfg.workdir=/tmp/workdir
+```
+
+| Script | Task |
+|---|---|
+| `examples/seq2seq.py` | Full fine-tuning for prompt → response (EN→FR translation) |
+| `examples/lora.py` | LoRA fine-tuning for the same seq2seq task |
+| `examples/classification.py` | Text classification on GLUE CoLA |
+| `examples/dpo.py` | DPO preference learning |
+| `examples/npo.py` | NPO unlearning |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="LoRA fine-tuning" icon="layers" href="/finetuning/lora">
+    Step-by-step guide to applying LoRA adapters with `gm.nn.LoRA`, training only adapter weights, and saving checkpoints with `gm.ckpts.SkipLoRA`.
+  </Card>
+  <Card title="gemma.peft module" icon="wrench" href="/finetuning/peft">
+    Lower-level PEFT building blocks: `LoRADense`, `ModuleInterceptor`, quantization-aware training wrappers, and parameter tree utilities.
+  </Card>
+</CardGroup>

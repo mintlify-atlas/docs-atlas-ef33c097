@@ -1,133 +1,91 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "Gemma: Open-Weight LLMs from Google DeepMind"
+description: "Gemma is a JAX library for running and fine-tuning Google DeepMind's open-weight LLMs. Supports Gemma 2, 3, 3n, and 4 with text, image, and audio inference."
 ---
 
-## Setting up
+Gemma is a JAX-based Python library for using and fine-tuning the Gemma family of open-weight large language models from Google DeepMind. With a unified API that spans Gemma 2, 3, 3n, and 4, you can run text, image, and audio inference — and fine-tune models using LoRA — with just a few lines of code.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install Gemma and run your first inference in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Download checkpoints" icon="download" href="/checkpoints">
+    Find and download pre-trained and instruction-tuned model weights
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Sampling and inference" icon="wand-magic-sparkles" href="/inference/sampling">
+    Run text generation with ChatSampler across all Gemma versions
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Fine-tuning" icon="sliders" href="/finetuning/overview">
+    Fine-tune Gemma models with LoRA and PEFT techniques
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What you can do with Gemma
 
-Everything you need to create world-class documentation.
+Gemma provides a consistent Python API for the full model lifecycle: loading checkpoints, running inference, and fine-tuning.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Multi-modal inference" icon="image" href="/inference/multimodal">
+    Process text, images, and audio with Gemma 4's unified ChatSampler
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Tool use" icon="screwdriver-wrench" href="/inference/tool-use">
+    Give Gemma access to external tools and functions via MCP
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="LoRA fine-tuning" icon="code-branch" href="/finetuning/lora">
+    Efficiently fine-tune large models with low-rank adapters
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Multi-device sharding" icon="server" href="/advanced/sharding">
+    Scale inference across GPUs and TPUs with JAX sharding
   </Card>
-</Columns>
+</CardGroup>
 
-## Make your content agent ready
+## Get started in three steps
 
-Make your docs work for humans and AI agents alike.
+<Steps>
+  <Step title="Install JAX and Gemma">
+    First install JAX for your hardware (CPU, GPU, or TPU), then install the `gemma` package from PyPI.
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
+    ```bash
+    pip install jax  # or jax[cuda12] for GPU
+    pip install gemma
+    ```
+  </Step>
+  <Step title="Download a checkpoint">
+    Gemma model weights are hosted on Kaggle Hub. Download the Flax variant for use with this library.
 
-## Need inspiration?
+    ```python
+    import kagglehub
+    kagglehub.login()
+    weights_dir = kagglehub.model_download('google/gemma-3/flax/gemma3-4b-it')
+    ```
+  </Step>
+  <Step title="Run inference">
+    Load the model and start a conversation using `ChatSampler`, which works with all Gemma versions.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    ```python
+    from gemma import gm
+
+    model = gm.nn.Gemma3_4B()
+    params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
+
+    sampler = gm.text.ChatSampler(model=model, params=params)
+    response = sampler.chat("Explain transformers in one paragraph.")
+    print(response)
+    ```
+  </Step>
+</Steps>
+
+## Supported models
+
+Gemma supports the full model family across four generations:
+
+| Family | Sizes | Multi-modal |
+|--------|-------|-------------|
+| Gemma 2 | 2B, 9B, 27B | Text only |
+| Gemma 3 | 270M, 1B, 4B, 12B, 27B | Text + images |
+| Gemma 3n | E2B, E4B | Text only (JAX) |
+| Gemma 4 | E2B, E4B, 26B-A4B, 31B | Text + images + audio |
+
+<Note>
+  All models are available in both pre-trained (PT) and instruction-tuned (IT) variants. For most use cases, use the IT variant.
+</Note>

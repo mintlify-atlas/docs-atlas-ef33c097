@@ -1,0 +1,210 @@
+---
+title: "Parameter-efficient fine-tuning with the gemma.peft module"
+description: "Low-level building blocks for LoRA adapters, quantization-aware training, and module surgery on Flax linen models using the gemma.peft submodule."
+---
+
+The `gemma.peft` module provides low-level primitives for modifying Flax linen models without rewriting them from scratch. It covers three concerns: adding LoRA adapters to linear layers, simulating or applying weight quantization, and intercepting module construction to perform module surgery at call time. These primitives are the foundation on which the higher-level `gm.nn.LoRA` and `gm.nn.QuantizationAwareWrapper` wrappers are built.
+
+## Module overview
+
+```python
+import gemma.peft as peft
+```
+
+<CardGroup cols={2}>
+  <Card title="LoRA adapters" icon="layers">
+    `LoRADense`, `LoRAEinsum`, `LoRADenseGeneral` wrap existing Flax layers and add a low-rank branch. Adapter-only variants (`LoRADenseAdapter`, etc.) expose just the `x @ A @ B` path.
+  </Card>
+  <Card title="Quantization" icon="microchip">
+    `SimulateQuantizedDense` / `SimulateQuantizedEinsum` simulate INT4, INT8, Q4\_0, or SFP8 quantization during training. `IntDense` / `IntEinsum` hold true `jnp.int4` weights for inference.
+  </Card>
+  <Card title="Interceptors" icon="wrench">
+    `ModuleInterceptor` and `Interceptor` intercept module construction inside a `with` block, letting you swap any layer for a modified version without touching model code.
+  </Card>
+  <Card title="Param utilities" icon="tree">
+    `split_params`, `merge_params`, `fuse_params`, and `unfuse_params` manipulate nested parameter trees to separate or combine base and adapter weights.
+  </Card>
+</CardGroup>
+
+## LoRA via `peft._lora`
+
+LoRA ([Hu et al., 2021](https://arxiv.org/abs/2106.09685)) decomposes a weight update into two low-rank matrices **A** and **B** so that only a small number of additional parameters need to be trained. `gemma.peft` provides wrapper modules and standalone adapter modules for the three Flax layer types used inside Gemma.
+
+### Wrapper modules
+
+Each wrapper shares the Flax scope with the wrapped layer so that the parameter tree stays flat (no extra nesting level). The output of the wrapped layer and the adapter are summed:
+
+```python
+from flax import linen as nn
+from gemma import peft
+
+class MyModel(nn.Module):
+
+  @nn.compact
+  def __call__(self, x):
+    # LoRADense wraps nn.Dense and adds a rank-4 adapter branch.
+    layer = peft.LoRADense(
+        rank=4,
+        wrapped=nn.Dense(features=256),
+    )
+    return layer(x)
+```
+
+The same pattern applies to `peft.LoRAEinsum` (wrapping `nn.Einsum`) and `peft.LoRADenseGeneral` (wrapping `nn.DenseGeneral`).
+
+### Adapter-only modules
+
+If you want full control over how the base and adapter outputs are combined, use the adapter-only variants. These perform only the `x @ A @ B` computation and leave the summation to you:
+
+```python
+class MyModel(nn.Module):
+
+  @nn.compact
+  def __call__(self, x):
+    dense = nn.Dense(features=256)
+    # LoRADenseAdapter only computes x @ A @ B.
+    lora = peft.LoRADenseAdapter(rank=4, features=256)
+    return dense(x) + lora(x)
+```
+
+`LoRAEinsumAdapter` generalises this to arbitrary einsum strings by automatically decomposing `BTNH,NHD->BTD` into the matching low-rank form `BTNH,NHr,rD->BTD`.
+
+<ParamField path="rank" type="int" required>
+  Rank of the low-rank decomposition. Lower values reduce parameter count; higher values increase expressiveness.
+</ParamField>
+
+<ParamField path="dtype" type="jnp.dtype" default="jnp.float_">
+  Data type for the LoRA weight matrices A and B.
+</ParamField>
+
+<ParamField path="a_init" type="nn.initializers.Initializer" default="kaiming_uniform()">
+  Initializer for the A matrix. Kaiming uniform is the standard LoRA initializer to preserve the pre-training distribution at init.
+</ParamField>
+
+<ParamField path="b_init" type="nn.initializers.Initializer" default="zeros_init()">
+  Initializer for the B matrix. Zeros ensure the adapter output is zero at the start of training.
+</ParamField>
+
+## Module interceptors
+
+`ModuleInterceptor` is a context manager that intercepts every `nn.Module` construction that happens inside the `with` block and applies a user-supplied replacement function. This enables module surgery without modifying model source code.
+
+```python
+def _replace_dense_by_lora(module: nn.Module) -> nn.Module:
+    if isinstance(module, nn.Dense):
+        return peft.LoRADense(rank=4, wrapped=module)
+    return module
+
+# All nn.Dense layers inside model(x) become LoRADense layers.
+with peft.ModuleInterceptor(_replace_dense_by_lora):
+    y = model(x)
+```
+
+The same mechanism is used internally by `gm.nn.LoRA`, which applies `_replace_dense_by_lora`-style logic to `nn.Dense`, `nn.Einsum`, `nn.DenseGeneral`, and the Gemma-specific `_layers.Einsum` in one call.
+
+## Quantization-aware training
+
+`gemma.peft` provides simulation wrappers that replace the forward pass weight with a quantized approximation while passing gradients through unchanged (straight-through estimator). This lets you train a checkpoint that behaves like a quantized model before committing to actual integer weights.
+
+### Supported methods
+
+| Method | Description |
+|--------|-------------|
+| `QuantizationMethod.INT4` | Per-channel uniform 4-bit quantization |
+| `QuantizationMethod.INT8` | Per-channel uniform 8-bit quantization |
+| `QuantizationMethod.Q4_0` | Block-wise 4-bit quantization (block size 32) |
+| `QuantizationMethod.Q4_0_TRANSPOSE` | Block-wise 4-bit with transposed layout (used for FFN gating layers) |
+| `QuantizationMethod.SFP8` | Scaled floating-point 8-bit quantization |
+
+### Simulation wrappers
+
+```python
+class MyModel(nn.Module):
+
+  @nn.compact
+  def __call__(self, x):
+    layer = peft.SimulateQuantizedDense(
+        wrapped=nn.Dense(features=256),
+        method=peft.QuantizationMethod.Q4_0,
+    )
+    return layer(x)
+```
+
+`SimulateQuantizedEinsum` provides the same behaviour for einsum layers. Both wrappers share scope with the wrapped module so the parameter layout is unchanged.
+
+You can also call `peft.simulate_quantize` directly on any array:
+
+```python
+w_quantized = peft.simulate_quantize(
+    w,
+    method=peft.QuantizationMethod.INT4,
+    axis_to_reduce=None,
+)
+```
+
+### Applying quantization to a checkpoint
+
+After simulation-based training, convert the floating-point parameters to true integer weights:
+
+```python
+params_int4 = peft.quantize(
+    params,
+    method=peft.QuantizationMethod.INT4,
+)
+```
+
+Then load them at inference time using `IntDense` / `IntEinsum`, which store `jnp.int4` kernels alongside per-channel scale factors and dequantize on the fly during the forward pass.
+
+### Q4\_0 and transposed layouts
+
+Q4\_0 uses per-block scaling (block size 32). The first linear layer of each feed-forward block in Gemma uses a transposed weight layout, so `Q4_0_TRANSPOSE` must be used for those layers. `ModuleInterceptor` makes it straightforward to apply the correct variant based on the module name:
+
+```python
+def _apply_q4_0(module: nn.Module) -> nn.Module:
+    if isinstance(module, nn.Dense):
+        if 'gating' in module.name.lower():
+            return peft.SimulateQuantizedDense(
+                wrapped=module,
+                method=peft.QuantizationMethod.Q4_0_TRANSPOSE,
+            )
+        else:
+            return peft.SimulateQuantizedDense(
+                wrapped=module,
+                method=peft.QuantizationMethod.Q4_0,
+            )
+    return module
+
+with peft.ModuleInterceptor(_apply_q4_0):
+    y = model(x)
+```
+
+## Parameter tree utilities
+
+When using LoRA, the adapter weights (`lora/a`, `lora/b`) are nested inside the same parameter tree as the base weights. The `peft` module provides helpers to split and recombine these trees.
+
+```python
+params = {
+    'dense': {
+        'kernel': ...,
+        'bias': ...,
+        'lora': {'a': ..., 'b': ...},
+    },
+    'other': ...,
+}
+
+# Separate base weights from LoRA adapter weights.
+base_params, lora_params = peft.split_params(params)
+
+# Recombine after, e.g., saving LoRA weights separately.
+merged = peft.merge_params(base_params, lora_params)
+
+# Fold adapter weights into the base weights permanently.
+fused = peft.fuse_params(params)
+
+# Recover the unfused representation from fused weights.
+unfused = peft.unfuse_params(fused)
+```
+
+## Difference from `gm.nn.LoRA`
+
+`gm.nn.LoRA` is a convenience wrapper that applies `ModuleInterceptor` to a full Gemma model, handling the `_layers.Einsum` scope-sharing edge cases that arise from Gemma's `FeedForward` implementation. Use `gemma.peft` directly when you need fine-grained control — for example, to apply LoRA only to attention projections, to combine LoRA with quantization simulation, or to integrate adapters into a custom model architecture.

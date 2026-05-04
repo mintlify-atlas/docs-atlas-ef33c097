@@ -1,0 +1,191 @@
+---
+title: "Tool use and function calling with Gemma ToolSampler"
+description: "Give Gemma access to external functions and services with ToolSampler — including custom Python tools and MCP server integration via fastmcp."
+---
+
+Tool use lets Gemma call external functions during generation and incorporate their results into the response. When the model decides a tool is needed, it emits a structured JSON call that `ToolSampler` intercepts, executes via the registered handler, and feeds back to the model as a tool response — all within a single `.chat()` call from the user's perspective.
+
+<Note>
+  Gemma 1, 2, and 3 models were not specifically trained for tool use. Tool use works best with Gemma 4 instruction-tuned models. Results with earlier model versions are experimental.
+</Note>
+
+## Overview
+
+<CardGroup cols={2}>
+  <Card title="ToolSampler" icon="wrench">
+    A subclass of `ChatSampler` that adds an automatic tool-call detection and execution loop. The public `.chat()` API is identical.
+  </Card>
+  <Card title="Tool handlers" icon="plug">
+    `ToolHandlerBase` orchestrates tool dispatch. Use `McpToolHandler` for MCP servers or subclass `ToolHandlerBase` directly.
+  </Card>
+  <Card title="MCP integration" icon="server">
+    Connect to any MCP-compatible server via `fastmcp.Client`. The sampler discovers available tools and calls them automatically.
+  </Card>
+  <Card title="Custom tools" icon="code">
+    Subclass `gm.tools.Tool`, define `DESCRIPTION`, `EXAMPLE`, and a `call()` method, and pass it to `ToolSampler`.
+  </Card>
+</CardGroup>
+
+## ToolSampler
+
+`gm.text.ToolSampler` extends `gm.text.ChatSampler` with one additional required field: `tool_handler`. Everything else — `multi_turn`, `sampling`, `print_stream`, `cache_length`, etc. — is inherited and works identically.
+
+```python
+from gemma import gm
+
+model = gm.nn.Gemma3_4B()
+params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
+
+sampler = gm.text.ToolSampler(
+    model=model,
+    params=params,
+    tool_handler=my_handler,  # see sections below for how to create this
+    print_stream=True,
+)
+
+output = sampler.chat("What is today's date?")
+```
+
+### How the tool loop works
+
+<Steps>
+  <Step title="Model generates a tool call">
+    The model emits a JSON-structured tool call followed by the `<|tool_response>` token, signalling that it is waiting for an external result.
+  </Step>
+  <Step title="ToolSampler intercepts the call">
+    `ToolSampler.chat()` detects the `<|tool_response>` marker in the model output and passes the call to `tool_handler.maybe_execute_tool()`.
+  </Step>
+  <Step title="Tool is executed">
+    `ToolHandlerBase.call_tool()` dispatches to the registered function and returns the result as an `mcp.types.CallToolResult`.
+  </Step>
+  <Step title="Result is fed back to the model">
+    The tool response is injected as a model turn and `.chat()` is called recursively with `multi_turn=True`. The model continues generation with the result in context.
+  </Step>
+  <Step title="Final answer is returned">
+    Once the model produces a response that does not end with a tool call, the final text is returned to the caller.
+  </Step>
+</Steps>
+
+<Note>
+  Only the final answer is returned by `.chat()`. To inspect intermediate tool calls and responses, access the full conversation history via `sampler.turns`.
+</Note>
+
+## MCP integration
+
+The `McpToolHandler` class bridges `ToolSampler` to any server that speaks the [Model Context Protocol](https://modelcontextprotocol.io/) via `fastmcp`. Install the required packages first:
+
+```bash
+pip install gemma fastmcp mcp
+```
+
+Then wrap your MCP server or client with `McpToolHandler`:
+
+```python
+import fastmcp
+from gemma import gm
+from gemma.gm.tools._mcp_manager import McpToolHandler
+
+# Connect to an MCP server process or in-process FastMCP app
+server = fastmcp.FastMCP("my-server")
+
+@server.tool()
+def get_weather(city: str) -> str:
+    """Return current weather for a city."""
+    return f"Sunny, 22°C in {city}"
+
+handler = McpToolHandler(mcp_client=fastmcp.Client(server))
+
+sampler = gm.text.ToolSampler(
+    model=model,
+    params=params,
+    tool_handler=handler,
+    print_stream=True,
+)
+
+output = sampler.chat("What's the weather like in Paris?")
+print(output)
+```
+
+`McpToolHandler` acts as a context manager internally — it opens the `fastmcp.Client` connection on the first tool call and tears it down when the handler is no longer active.
+
+<Tip>
+  You can also pass a `fastmcp.FastMCP` instance, a `fastmcp.Client`, or a server URL string directly to `McpToolHandler(mcp_client=...)`. The handler wraps plain values in a `fastmcp.Client` automatically.
+</Tip>
+
+## Custom tools
+
+When you don't have an MCP server, you can define tools by subclassing `gm.tools.ToolHandlerBase`. Override `_tools()` to return a list of `mcp.types.Tool` objects (with name, description, and input schema), and implement `_call_tool()` to execute each tool by name:
+
+```python
+import datetime
+import mcp.types as mcp_types
+from gemma import gm
+
+
+class DateTimeHandler(gm.tools.ToolHandlerBase):
+    """Tool handler that returns the current date/time."""
+
+    def _tools(self) -> list[mcp_types.Tool]:
+        return [
+            mcp_types.Tool(
+                name="get_datetime",
+                description="Return the current date and time formatted with strftime.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "format": {
+                            "type": "string",
+                            "description": "strftime format string, e.g. '%Y-%m-%d'",
+                        }
+                    },
+                    "required": ["format"],
+                },
+            )
+        ]
+
+    def _call_tool(self, name: str, arguments: dict) -> mcp_types.CallToolResult:
+        if name == "get_datetime":
+            result = datetime.datetime.now().strftime(arguments["format"])
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text=result)]
+            )
+        raise ValueError(f"Unknown tool: {name}")
+
+
+sampler = gm.text.ToolSampler(
+    model=model,
+    params=params,
+    tool_handler=DateTimeHandler(),
+    print_stream=True,
+)
+
+output = sampler.chat("What day of the week is today?")
+print(output)
+```
+
+## Tool handler API
+
+`gm.tools.ToolHandlerBase` is the base class for all tool handlers. Subclass it to build custom dispatch logic.
+
+<ParamField path="add_system_prompt" type="method">
+  Called before the first model turn. Injects tool definitions (names, schemas, examples) into the system prompt so the model knows which tools are available.
+</ParamField>
+
+<ParamField path="maybe_execute_tool" type="method">
+  Called after every model turn. Returns `None` if the model did not request a tool call, or a list of `dialog.ToolResponse` objects to feed back to the model.
+</ParamField>
+
+<ParamField path="call_tool" type="method">
+  Dispatches to `_call_tool(name, arguments)`. Override `_call_tool` in your subclass to implement the actual function execution.
+</ParamField>
+
+## Accessing conversation history
+
+After one or more `.chat()` calls, `sampler.turns` contains the full conversation including all intermediate tool calls and responses:
+
+```python
+output = sampler.chat("Compute the 10th Fibonacci number using the calculator.")
+
+for turn in sampler.turns:
+    print(turn)
+```

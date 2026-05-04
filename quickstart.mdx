@@ -1,81 +1,165 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
-icon: 'rocket'
+title: "Quickstart: run Gemma inference with JAX in minutes"
+description: "Install the Gemma JAX library, download a checkpoint from Kaggle Hub, and run your first text and multi-modal inference in under ten minutes."
 ---
 
-## Get started in three steps
+This guide takes you from a fresh Python environment to running a live conversation with a Gemma model. You will install JAX and the `gemma` package, download a checkpoint, and make two calls—one text-only and one multi-modal—using the `ChatSampler` API.
 
-Get your documentation site running locally and make your first customization.
+## System requirements
 
-### Step 1: Set up your local environment
+Before you begin, confirm your environment meets these minimums:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+| Hardware | Minimum RAM | Recommended model |
+|----------|-------------|-------------------|
+| CPU | 16 GB system RAM | Gemma 3 270M or 1B |
+| GPU | 8 GB VRAM | Gemma 3 1B or 4B |
+| GPU | 24 GB VRAM | Gemma 3 12B or 27B |
+| TPU | — | Any size |
 
-### Step 2: Deploy your changes
+<Steps>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Step title="Install JAX for your hardware">
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+JAX must be installed before `gemma`. Follow the [official JAX installation guide](https://jax.readthedocs.io/en/latest/installation.html) to pick the right variant for your hardware.
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash
+# CPU-only (quickest to start)
+pip install jax
 
-### Step 3: Go live
+# NVIDIA GPU (CUDA 12)
+pip install "jax[cuda12]"
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+# Google TPU
+pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
+
+</Step>
+
+<Step title="Install the gemma package">
+
+```bash
+pip install gemma
+```
+
+This installs the library and all required dependencies, including Flax, Orbax, and SentencePiece.
+
+</Step>
+
+<Step title="Get a Kaggle account and API token">
+
+Gemma checkpoints are hosted on Kaggle Hub and require a free Kaggle account.
+
+1. Create an account at [kaggle.com](https://www.kaggle.com) if you do not have one.
+2. Go to **Settings → API → Create New Token** to download `kaggle.json`.
+3. Place the file at `~/.kaggle/kaggle.json` (Linux/macOS) or `%USERPROFILE%\.kaggle\kaggle.json` (Windows).
+4. Accept the Gemma model licence on the [Gemma 3 Kaggle page](https://www.kaggle.com/models/google/gemma-3).
+
+<Note>
+You must accept the model licence on Kaggle before any programmatic download will succeed. The licence must be accepted once per Gemma model family.
+</Note>
+
+</Step>
+
+<Step title="Download a checkpoint">
+
+Use `kagglehub` to download the model weights programmatically. The 4B instruction-tuned model is a good starting point—it fits in 8 GB of GPU VRAM when loaded in bfloat16.
+
+```python
+import kagglehub
+
+kagglehub.login()
+
+weights_dir = kagglehub.model_download('google/gemma-3/flax/gemma3-4b-it')
+print(weights_dir)
+```
+
+The downloaded archive contains the model weights directory and the tokenizer:
+
+```
+4b/              # Model weight shards
+tokenizer.model  # SentencePiece tokenizer
+```
+
+Alternatively, you can use a `CheckpointPath` enum value directly with `gm.ckpts.load_params`, which resolves to a Google Cloud Storage path. See the [Checkpoints](/checkpoints) page for the full list.
+
+</Step>
+
+<Step title="Run text inference">
+
+Load the model architecture and weights, then start a chat session.
+
+```python
+from gemma import gm
+
+# Instantiate the model architecture
+model = gm.nn.Gemma3_4B()
+
+# Load the weights — resolves the GCS path and streams the checkpoint
+params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
+
+# Create a sampler for multi-turn conversation
+sampler = gm.text.ChatSampler(
+    model=model,
+    params=params,
+    multi_turn=True,
+)
+
+response = sampler.chat('Explain the difference between JAX and PyTorch in two sentences.')
+print(response)
+```
+
+<Tip>
+Set `multi_turn=True` to carry conversation history across calls. Each subsequent `sampler.chat(...)` call is aware of the previous turns.
+</Tip>
+
+</Step>
+
+<Step title="Run multi-modal inference">
+
+Gemma 3, 3n, and 4 accept image inputs via the `<|image|>` token. Pass image arrays alongside your text prompt.
+
+```python
+from gemma import gm
+
+# Use a vision-capable model
+model = gm.nn.Gemma4_E4B()
+params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA4_E4B_IT)
+
+sampler = gm.text.ChatSampler(
+    model=model,
+    params=params,
+    multi_turn=True,
+)
+
+# image1 and image2 are numpy arrays of shape (H, W, 3), dtype uint8
+prompt = """Which of the 2 images do you prefer?
+
+Image 1: <|image|>
+Image 2: <|image|>
+
+Write your answer as a poem."""
+
+out0 = sampler.chat(prompt, images=[image1, image2])
+print(out0)
+
+# Follow-up turns don't need to re-supply the images
+out1 = sampler.chat('What about the other image?')
+print(out1)
+```
+
+The `<|image|>` tokens are positional placeholders; their order maps to the order of the `images` list.
+
+</Step>
+
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="All checkpoints" icon="database" href="/checkpoints">
+    See every available model size and variant, and learn how to save your own checkpoints.
+  </Card>
+  <Card title="Introduction" icon="book" href="/introduction">
+    Read the full overview of Gemma model families and library capabilities.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

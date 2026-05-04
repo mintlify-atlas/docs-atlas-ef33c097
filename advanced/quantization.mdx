@@ -1,0 +1,171 @@
+---
+title: "INT4 quantization for Gemma models with reduced memory"
+description: "Reduce Gemma model memory with INT4 quantization, including pre-quantized checkpoints, quantization-aware training, and inference with IntWrapper."
+---
+
+Quantization reduces the memory required to store and run Gemma models by representing weights with fewer bits. Gemma supports INT4 weight quantization, which roughly halves parameter memory compared to BF16, with a modest impact on accuracy. Two distinct workflows are available: loading a pre-quantized checkpoint for inference, and quantization-aware training (QAT) to produce a well-calibrated quantized checkpoint from a floating-point one.
+
+## Quantization classes in `gm.nn`
+
+`gm.nn` exposes two wrappers that sit around a Gemma model and modify how its linear layers compute their outputs.
+
+### `QuantizationAwareWrapper`
+
+`QuantizationAwareWrapper` replaces every `nn.Dense` and `nn.Einsum` inside the wrapped model with a simulation wrapper from `gemma.peft`. Weights are stored in full precision and a straight-through estimator ensures gradients flow during training, but the forward pass produces outputs that match the quantized model:
+
+```python
+from gemma import gm
+
+model = gm.nn.QuantizationAwareWrapper(
+    method=gm.peft.QuantizationMethod.INT4,
+    model=gm.nn.Gemma3_4B(tokens="batch.input"),
+)
+```
+
+<ParamField path="method" type="peft.QuantizationMethod" default="QuantizationMethod.NONE">
+  Quantization method to simulate during training. Supported values: `INT4`, `INT8`, `Q4_0`, `Q4_0_TRANSPOSE`, `SFP8`.
+</ParamField>
+
+<ParamField path="model" type="nn.Module" required>
+  The Gemma model to wrap. Attribute accesses and Kauldron key bindings are forwarded transparently to the inner model.
+</ParamField>
+
+The wrapper shares the Flax scope with the inner model, so the parameter tree layout is unchanged. This means checkpoints saved from a `QuantizationAwareWrapper` are structurally identical to those saved from the unwrapped model.
+
+### `IntWrapper`
+
+`IntWrapper` replaces linear layers with `peft.IntDense` / `peft.IntEinsum` modules that store `jnp.int4` kernels alongside per-channel scale factors. This is the inference-time counterpart to `QuantizationAwareWrapper`:
+
+```python
+model = gm.nn.IntWrapper(
+    model=gm.nn.Gemma3_4B(tokens="batch.input"),
+    dtype=jnp.int4,
+)
+```
+
+<ParamField path="model" type="nn.Module" required>
+  The Gemma model to wrap.
+</ParamField>
+
+<ParamField path="dtype" type="jnp.dtype" default="jnp.int4">
+  Integer dtype to use for quantized kernel storage.
+</ParamField>
+
+At inference time, `IntWrapper` dequantizes each kernel in-place by dividing by the stored scale before the matrix multiply, so the rest of the computation runs in the model's native BF16 dtype.
+
+## Loading pre-quantized checkpoints
+
+Gemma provides INT4-quantized checkpoints on Kaggle. To use them, pass `quantize=True` to `gm.ckpts.LoadCheckpoint`:
+
+```python
+init_transform = gm.ckpts.LoadCheckpoint(
+    path=gm.ckpts.CheckpointPath.GEMMA3_4B_IT,
+    quantize=True,
+)
+```
+
+When `quantize=True`, the loader converts the floating-point checkpoint to the `IntWrapper`-compatible layout by remapping kernel keys to the `_IntEinsum_*` naming convention expected by `IntWrapper`.
+
+## Quantization-aware training workflow
+
+<Steps>
+  <Step title="Wrap the model with QuantizationAwareWrapper">
+    Use `gm.nn.QuantizationAwareWrapper` in your trainer config. The inner model's weights remain in full precision; only the forward pass is affected.
+
+    ```python
+    model = gm.nn.QuantizationAwareWrapper(
+        method=peft.QuantizationMethod.INT4,
+        model=gm.nn.Gemma3_4B(tokens="batch.input"),
+    )
+    ```
+  </Step>
+  <Step title="Train normally">
+    Run your training loop as usual. The straight-through estimator ensures that gradients flow through the simulated quantization ops.
+  </Step>
+  <Step title="Convert the checkpoint to INT4">
+    After training, convert the floating-point parameters to the `IntWrapper`-compatible format using `convert_to_qat_checkpoint` from `gemma.gm.ckpts`:
+
+    ```python
+    from gemma.gm.ckpts import _quantization as ckpt_quant
+
+    int4_params = ckpt_quant.convert_to_qat_checkpoint(params)
+    ```
+
+    This remaps kernel weights under the `_SimulateQuantizedEinsum_*` namespace to the `_IntEinsum_*` namespace and separates `kernel` and `scale` entries.
+  </Step>
+  <Step title="Run inference with IntWrapper">
+    Load the converted checkpoint and wrap the model with `IntWrapper` for deployment:
+
+    ```python
+    model = gm.nn.IntWrapper(
+        model=gm.nn.Gemma3_4B(tokens="batch.input"),
+    )
+    ```
+  </Step>
+</Steps>
+
+## Low-level quantization with `gemma.peft`
+
+For custom models or architectures that do not use `gm.nn` wrappers, `gemma.peft` exposes the quantization primitives directly.
+
+### `simulate_quantize`
+
+Simulate quantization on any array:
+
+```python
+from gemma import peft
+
+w_sim = peft.simulate_quantize(
+    w,
+    method=peft.QuantizationMethod.INT4,
+    axis_to_reduce=None,
+)
+```
+
+### `SimulateQuantizedDense` and `SimulateQuantizedEinsum`
+
+Wrap individual layers to enable QAT in a custom Flax module:
+
+```python
+class MyModel(nn.Module):
+
+  @nn.compact
+  def __call__(self, x):
+    layer = peft.SimulateQuantizedDense(
+        wrapped=nn.Dense(features=256),
+        method=peft.QuantizationMethod.Q4_0,
+    )
+    return layer(x)
+```
+
+### `IntDense` and `IntEinsum`
+
+For inference with stored integer weights:
+
+```python
+class MyModel(nn.Module):
+
+  @nn.compact
+  def __call__(self, x):
+    layer = peft.IntDense(
+        wrapped=nn.Dense(features=256),
+        dtype=jnp.int4,
+    )
+    return layer(x)
+```
+
+`IntDense` stores a `jnp.int4` kernel and a BF16 scale, then computes `(kernel.astype(bfloat16) / scale) @ x` during the forward pass.
+
+## Supported quantization methods
+
+| Method | Granularity | Bits | Notes |
+|--------|-------------|------|-------|
+| `INT4` | Per-channel | 4 | Default for Gemma quantization |
+| `INT8` | Per-channel | 8 | Higher accuracy, larger memory |
+| `Q4_0` | Per-block (32) | 4 | Compatible with llama.cpp format |
+| `Q4_0_TRANSPOSE` | Per-block (32) | 4 | Used for FFN gating layers |
+| `SFP8` | Per-channel | 8 (float) | Scaled floating-point 8-bit |
+
+<Warning>
+  `Q4_0_TRANSPOSE` must be used for the first linear layer in each feed-forward block (the `gating_einsum` weight) because that weight is stored with a transposed layout in Gemma checkpoints. Using `Q4_0` on those layers will produce incorrect results.
+</Warning>

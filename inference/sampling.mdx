@@ -1,0 +1,228 @@
+---
+title: "Text generation and sampling with Gemma ChatSampler"
+description: "Generate text with Gemma 2, 3, 3n, and 4 using ChatSampler — a unified, stateful API that handles conversation formatting and KV-cache automatically."
+---
+
+`gm.text.ChatSampler` is the primary entry point for text generation in the Gemma JAX library. It wraps the underlying model and tokenizer into a single, stateful object that handles prompt formatting, the KV-cache, and multi-turn conversation tracking across all Gemma versions (2, 3, 3n, and 4). Under the hood, `ChatSampler` automatically selects the correct sampler implementation — `Sampler` for Gemma 2/3/3n, and `Gemma4Sampler` for Gemma 4 — based on the model's tokenizer version.
+
+## ChatSampler overview
+
+<CardGroup cols={2}>
+  <Card title="Unified API" icon="layers">
+    One class works with Gemma 2, 3, 3n, and 4. The correct underlying sampler and prompt format are selected automatically from the model.
+  </Card>
+  <Card title="Stateful multi-turn" icon="messages-square">
+    When `multi_turn=True`, the KV-cache and conversation history are preserved across `.chat()` calls without any manual state management.
+  </Card>
+  <Card title="Streaming output" icon="rss">
+    Set `print_stream=True` to stream tokens to the terminal (or a Colab widget) as they are generated.
+  </Card>
+  <Card title="Pluggable sampling" icon="sliders-horizontal">
+    Pass any `SamplingMethod` — greedy, random, top-k, or nucleus — at construction time or per call.
+  </Card>
+</CardGroup>
+
+## Basic usage
+
+### Single-turn
+
+The simplest usage creates a `ChatSampler`, calls `.chat()` once, and receives the model's reply as a plain string. Each call starts a fresh conversation by default.
+
+```python
+from gemma import gm
+
+model = gm.nn.Gemma3_4B()
+params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
+
+sampler = gm.text.ChatSampler(
+    model=model,
+    params=params,
+)
+
+output = sampler.chat("Write a one-sentence summary of the French Revolution.")
+print(output)
+```
+
+### Multi-turn conversation
+
+Set `multi_turn=True` so the sampler retains context between calls. Each subsequent `.chat()` continues the same conversation thread.
+
+```python
+sampler = gm.text.ChatSampler(
+    model=model,
+    params=params,
+    multi_turn=True,
+    print_stream=True,  # stream tokens as they are generated
+)
+
+turn0 = sampler.chat('Share one metaphor linking "shadow" and "laughter".')
+turn1 = sampler.chat("Expand it into a haiku.")
+turn2 = sampler.chat("Which version do you prefer, and why?")
+```
+
+To reset conversation state mid-session, pass `multi_turn=False` on a specific call:
+
+```python
+# This call discards all previous context and starts fresh.
+fresh_output = sampler.chat("New topic entirely.", multi_turn=False)
+```
+
+## Key parameters
+
+<ParamField path="model" type="TransformerLike" required>
+  The Gemma transformer model instance (e.g. `gm.nn.Gemma3_4B()`).
+</ParamField>
+
+<ParamField path="params" type="Params" required>
+  Model parameters loaded via `gm.ckpts.load_params(...)`.
+</ParamField>
+
+<ParamField path="multi_turn" type="bool" default="False">
+  When `True`, the sampler preserves KV-cache and conversation history across `.chat()` calls. When `False` (default), each call starts a new conversation.
+</ParamField>
+
+<ParamField path="sampling" type="SamplingMethod" default="Greedy()">
+  The decoding strategy to use. Defaults to greedy decoding. Can be overridden per call via the `sampling=` argument to `.chat()`.
+</ParamField>
+
+<ParamField path="cache_length" type="int" default="4096">
+  Maximum total token capacity of the KV-cache across all turns (prompt + response + image tokens). Setting a fixed value prevents recompilation between turns.
+</ParamField>
+
+<ParamField path="max_out_length" type="int" default="2048">
+  Size of the output buffer for a single generation turn. Increase this only if the model regularly produces outputs longer than 2048 tokens.
+</ParamField>
+
+<ParamField path="print_stream" type="bool | dialog.Stream" default="False">
+  When `True`, tokens are printed to stdout as they are generated. In a Colab notebook, a `dialog.Stream` widget is used instead.
+</ParamField>
+
+<ParamField path="forbidden_tokens" type="Sequence[str | int] | None" default="None">
+  Tokens that the model is never allowed to emit. Each string must map to exactly one token id in the vocabulary.
+</ParamField>
+
+<ParamField path="stop_tokens" type="Sequence[str | int] | None" default="None">
+  Tokens that halt generation immediately when produced. Useful for stopping at delimiters or format markers.
+</ParamField>
+
+## Sampling methods
+
+By default, `ChatSampler` uses greedy decoding (`gm.text.Greedy()`). You can pass any sampling method at construction time, or supply `sampling=` as a keyword argument to individual `.chat()` calls.
+
+<Tabs>
+  <Tab title="Greedy">
+    Selects the single highest-probability token at every step. Fully deterministic; no `rng` needed.
+
+    ```python
+    sampler = gm.text.ChatSampler(
+        model=model,
+        params=params,
+        sampling=gm.text.Greedy(),  # default, can be omitted
+    )
+    ```
+  </Tab>
+  <Tab title="RandomSampling">
+    Draws the next token from the full vocabulary distribution, scaled by `temperature`. Higher temperature produces more varied output.
+
+    ```python
+    sampler = gm.text.ChatSampler(
+        model=model,
+        params=params,
+        sampling=gm.text.RandomSampling(temperature=0.8),
+    )
+    ```
+  </Tab>
+  <Tab title="TopkSampling">
+    Restricts sampling to the top-`k` most probable tokens before drawing. Combines controlled randomness with lexical diversity.
+
+    ```python
+    sampler = gm.text.ChatSampler(
+        model=model,
+        params=params,
+        sampling=gm.text.TopkSampling(k=40, temperature=0.9),
+    )
+    ```
+  </Tab>
+  <Tab title="TopPSampling">
+    Nucleus sampling: restricts to the smallest set of tokens whose cumulative probability exceeds `p`, then draws from that set.
+
+    ```python
+    sampler = gm.text.ChatSampler(
+        model=model,
+        params=params,
+        sampling=gm.text.TopPSampling(p=0.95, temperature=1.0),
+    )
+    ```
+  </Tab>
+</Tabs>
+
+You can also override the sampling method for a single call without reconstructing the sampler:
+
+```python
+# Use greedy by default, but sample creatively for one specific turn.
+output = sampler.chat(
+    "Write a poem about the ocean.",
+    sampling=gm.text.TopPSampling(p=0.9, temperature=1.1),
+)
+```
+
+## Streaming output
+
+Set `print_stream=True` to stream tokens to the terminal as they are generated:
+
+```python
+sampler = gm.text.ChatSampler(
+    model=model,
+    params=params,
+    multi_turn=True,
+    print_stream=True,
+)
+
+output = sampler.chat("Explain gradient descent in plain English.")
+# Tokens print incrementally; `output` contains the full string when done.
+```
+
+In a Jupyter / Colab notebook, `ChatSampler` automatically uses a `dialog.Stream` widget for inline rendering.
+
+## stop_tokens and forbidden_tokens
+
+Use `stop_tokens` to end generation early when a particular token appears. Use `forbidden_tokens` to prevent the model from ever producing a token.
+
+```python
+sampler = gm.text.ChatSampler(
+    model=model,
+    params=params,
+    # Stop generation as soon as the model produces "##".
+    stop_tokens=["##"],
+    # Never let the model emit the word "forbidden".
+    forbidden_tokens=["forbidden"],
+)
+```
+
+<Note>
+  Each string in `stop_tokens` or `forbidden_tokens` must correspond to exactly one token id in the tokenizer vocabulary. Multi-token strings will raise a `ValueError`.
+</Note>
+
+## Lower-level Sampler
+
+`gm.text.Sampler` is a stateless, lower-level alternative to `ChatSampler`. It gives you direct control over prompt formatting but requires you to manually manage state for multi-turn conversations. Prefer `ChatSampler` for most use cases.
+
+```python
+sampler = gm.text.Sampler(
+    model=model,
+    params=params,
+)
+
+# You must manually add <start_of_turn> / <end_of_turn> tokens.
+prompt = """<start_of_turn>user
+Give me a list of inspirational quotes.<end_of_turn>
+<start_of_turn>model
+"""
+
+output = sampler.sample(prompt, max_new_tokens=1000)
+print(output)
+```
+
+<Tip>
+  `gm.text.Sampler` supports batched inference by passing a list of prompt strings. `ChatSampler` does not batch — it is designed for single-user, interactive sessions.
+</Tip>

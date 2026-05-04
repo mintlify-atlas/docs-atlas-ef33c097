@@ -1,0 +1,297 @@
+---
+title: "Building custom Gemma transformers with gm.nn blocks"
+description: "Compose custom transformer variants from Gemma's gm.nn primitives: TransformerLike, Attention, Block, FeedForward, Embedder, RMSNorm, Einsum, and Cache."
+---
+
+All named Gemma model classes (`Gemma3_4B`, `Gemma2_27B`, and so on) are subclasses of `gm.nn.Transformer`, which is itself assembled from a set of independently usable building blocks exported from `gemma.gm.nn`. You can import these primitives directly to build custom transformer variants that still interoperate with the rest of the Gemma ecosystem — including `gm.text.Sampler`, LoRA wrappers, sharding, and quantization.
+
+## The `TransformerLike` protocol
+
+Any model you pass to `gm.text.Sampler` must satisfy the `gm.nn.TransformerLike` protocol. The protocol requires three methods and two class-level attributes:
+
+```python
+class TransformerLike(Protocol):
+    config: TransformerConfig
+    INFO: ClassVar[ModelInfo]
+
+    def __call__(
+        self,
+        tokens: Int['*B L'],
+        *,
+        images: UInt8['*B N H W C'] | None = None,
+        positions: Int['*B L_with_mm'] | None = None,
+        cache: Cache | None = None,
+        attention_mask: Bool['*B L_with_mm cache_length'] | None = None,
+        return_last_only: bool | None = None,
+        return_hidden_states: bool | None = None,
+    ) -> Output: ...
+
+    def apply(self, variables, tokens, ...) -> Any: ...
+
+    def init_cache(
+        self,
+        *,
+        batch_size: int,
+        dtype: jnp.dtype,
+        cache_length: int,
+        sharding: kd.sharding.ShardingTree | None = None,
+    ) -> Cache: ...
+```
+
+Subclassing `gm.nn.Transformer` automatically satisfies this protocol. For fully custom architectures, implement these methods directly in any `flax.linen.Module`.
+
+## The `Transformer` base class
+
+`gm.nn.Transformer` assembles the standard building blocks using a `TransformerConfig` dataclass. Subclassing it is the fastest way to create a new model variant:
+
+```python
+from gemma import gm
+from gemma.gm.nn import _config
+from gemma.gm.nn._modules import AttentionType
+
+my_config = _config.TransformerConfig(
+    num_embed=256_000,
+    embed_dim=2048,
+    hidden_dim=16_384,
+    num_heads=8,
+    head_dim=256,
+    num_kv_heads=4,
+    final_logit_softcap=30.0,
+    use_post_attn_norm=True,
+    use_post_ffw_norm=True,
+    attention_types=(AttentionType.GLOBAL,) * 18,
+)
+
+class MyGemma(gm.nn.Transformer):
+    config: _config.TransformerConfig = my_config
+    tokens: str = kontext.REQUIRED
+```
+
+The `Transformer.setup` method instantiates `Embedder`, a list of `Block` modules, and a final `RMSNorm` automatically based on the provided `config`.
+
+## Building blocks reference
+
+### `Embedder`
+
+Encodes integer token IDs into embedding vectors and decodes hidden states back to vocabulary logits using a shared weight matrix. For multimodal models it also handles soft token projection from the vision encoder.
+
+```python
+embedder = gm.nn.Embedder(
+    vocab_size=256_000,
+    embed_dim=2048,
+    vision_proj_dim=1152,  # Optional; set only for vision models.
+)
+
+# Token IDs -> embeddings
+x = embedder.encode(tokens)  # [B, L, embed_dim]
+
+# Hidden states -> logits
+logits = embedder.decode(x)  # [B, L, vocab_size]
+```
+
+<ParamField path="vocab_size" type="int" required>
+  Size of the token vocabulary.
+</ParamField>
+
+<ParamField path="embed_dim" type="int" required>
+  Dimension of the embedding space.
+</ParamField>
+
+<ParamField path="vision_proj_dim" type="int | None" default="None">
+  Output dimension of the SigLiP vision encoder. Required for multimodal models; omit for text-only.
+</ParamField>
+
+### `Attention`
+
+Multi-head attention with optional grouped query attention (GQA), RoPE positional encoding, QK normalization, and sliding-window local attention. Used inside every `Block`.
+
+```python
+attn = gm.nn.Attention(
+    num_heads=8,
+    num_kv_heads=4,          # GQA with 4 KV heads
+    features=2048,           # embed_dim
+    head_dim=256,
+    attn_type=gm.nn.AttentionType.GLOBAL,
+    query_pre_attn_scalar=256 ** -0.5,
+    attn_logits_soft_cap=50.0,
+    sliding_window_size=None,
+    use_qk_norm=True,
+)
+```
+
+`Attention.__call__` returns `(new_cache, attn_output)`. When `cache` is `None`, the module runs in training mode without caching.
+
+<ParamField path="num_heads" type="int" required>
+  Number of query heads.
+</ParamField>
+
+<ParamField path="num_kv_heads" type="int" required>
+  Number of key/value heads. Set equal to `num_heads` for standard MHA; set to a smaller value to use GQA.
+</ParamField>
+
+<ParamField path="features" type="int" required>
+  Model embedding dimension (input and output).
+</ParamField>
+
+<ParamField path="head_dim" type="int" required>
+  Dimension of each attention head.
+</ParamField>
+
+<ParamField path="attn_type" type="AttentionType" required>
+  `AttentionType.GLOBAL` for standard full-context attention; `AttentionType.LOCAL_SLIDING` for sliding-window attention. `sliding_window_size` must be set when using `LOCAL_SLIDING`.
+</ParamField>
+
+### `FeedForward`
+
+Gated MLP with GELU activation, matching the architecture used in all Gemma variants. Uses `_layers.Einsum` internally.
+
+```python
+ffn = gm.nn.FeedForward(
+    features=2048,       # embed_dim
+    hidden_dim=16_384,
+    transpose_gating_einsum=True,  # Set True for Gemma 3+
+)
+```
+
+<ParamField path="features" type="int" required>
+  Input and output dimension (equal to `embed_dim`).
+</ParamField>
+
+<ParamField path="hidden_dim" type="int" required>
+  Hidden dimension of the MLP.
+</ParamField>
+
+<ParamField path="transpose_gating_einsum" type="bool" required>
+  When `True`, uses the `...F,NHF->...NH` einsum convention (Gemma 3+). When `False`, uses `...F,NFH->...NH` (Gemma 2).
+</ParamField>
+
+### `Block`
+
+A complete transformer layer: `pre_attention_norm → Attention → residual → pre_ffw_norm → FeedForward → residual`, with optional post-attention and post-FFW norms.
+
+```python
+block = gm.nn.Block(
+    num_heads=8,
+    num_kv_heads=4,
+    embed_dim=2048,
+    head_dim=256,
+    hidden_dim=16_384,
+    use_post_attn_norm=True,
+    use_post_ffw_norm=True,
+    attn_type=gm.nn.AttentionType.GLOBAL,
+    query_pre_attn_scalar=256 ** -0.5,
+    transpose_gating_einsum=True,
+)
+```
+
+### `RMSNorm`
+
+Root mean square layer normalization. Takes no constructor arguments; the scale parameter is initialized to zeros (so initial output equals input, as `(1 + scale) * normalized`).
+
+```python
+from gemma.gm.nn import _layers
+
+norm = _layers.RMSNorm()
+x_normed = norm(x)
+```
+
+### `Einsum`
+
+Parameterized tensor contraction. Stores a single weight tensor of the given `shape` under the name `weight_name` and applies `jnp.einsum(eqn, x, w)`:
+
+```python
+layer = gm.nn.Einsum(
+    shape=(num_heads, head_dim, embed_dim),
+    weight_name='w',
+)
+
+output = layer('BTNH,NHD->BTD', x)
+```
+
+<ParamField path="shape" type="tuple[int, ...]" required>
+  Shape of the weight tensor.
+</ParamField>
+
+<ParamField path="weight_name" type="str" default="'w'">
+  Name of the parameter in the Flax variable collection. Used to address parameters in checkpoints.
+</ParamField>
+
+### `Cache`
+
+`Cache` is a type alias for `dict[str, LayerCache]`, where each `LayerCache` is a dict with keys `k`, `v`, `end_index`, and `positions`. Allocate a cache via the model's `init_cache` method:
+
+```python
+cache = model.init_cache(
+    batch_size=1,
+    dtype=jnp.bfloat16,
+    cache_length=512,
+)
+```
+
+The cache is passed to and returned from `model.__call__` on each decoding step. Each `Block` updates its layer cache slice in-place using `jax.lax.dynamic_update_slice`.
+
+## Special-purpose wrappers
+
+### `AnchoredPolicy` — DPO and preference learning
+
+`AnchoredPolicy` runs two copies of the model — a trainable `policy` and a frozen `anchor` — on the same input batch. This is the standard setup for DPO (Direct Preference Optimization) and similar algorithms.
+
+```python
+model = gm.nn.AnchoredPolicy(
+    policy=gm.nn.Gemma3_4B(tokens="batch.input"),
+    # anchor defaults to a stop-gradient copy of policy if omitted
+)
+```
+
+The output is an `AnchoredPolicyOutput` with `.policy` and `.anchor` fields, both containing full `Output` objects. Gradients do not flow through `.anchor`.
+
+<ParamField path="policy" type="nn.Module" required>
+  The model to train.
+</ParamField>
+
+<ParamField path="anchor" type="nn.Module | None" default="None">
+  Frozen reference model. If `None`, a copy of `policy` is used with `jax.lax.stop_gradient` applied to its outputs.
+</ParamField>
+
+### `SigLiPFromPatches` — vision encoder
+
+`SigLiPFromPatches` is the standalone vision encoder used in Gemma 3 multimodal variants. It processes image patch grids and returns soft token embeddings that are merged with text embeddings inside `Transformer._merge_mm_embeddings`.
+
+```python
+vision_encoder = gm.nn.SigLiPFromPatches(
+    image_height=448,
+    image_width=448,
+    ...
+)
+```
+
+You can access the vision encoder from a model instance via `model.vision_encoder` (forwarded through `Transformer.__getattr__`).
+
+## Example: custom two-layer transformer
+
+```python
+import flax.linen as nn
+from gemma import gm
+from gemma.gm.nn import _config, _layers
+from gemma.gm.nn._modules import AttentionType
+import jax.numpy as jnp
+
+config = _config.TransformerConfig(
+    num_embed=256_000,
+    embed_dim=512,
+    hidden_dim=2048,
+    num_heads=4,
+    head_dim=128,
+    num_kv_heads=4,
+    final_logit_softcap=None,
+    use_post_attn_norm=False,
+    use_post_ffw_norm=False,
+    attention_types=(AttentionType.GLOBAL, AttentionType.GLOBAL),
+)
+
+class TinyGemma(gm.nn.Transformer):
+    config: _config.TransformerConfig = config
+    tokens: str = "batch.tokens"
+```
+
+`TinyGemma` inherits `setup`, `__call__`, `init_cache`, and all sharding and quantization compatibility from `gm.nn.Transformer`.
